@@ -8,21 +8,25 @@
   <maintainer email="lexondms1@g.skku.edu">eunseop</maintainer>
   <license>MIT</license>
 
-  <!-- ========== Dependencies ========== -->
-  <!-- Core ROS2 -->
+  <!-- ========== Build tool ========== -->
   <buildtool_depend>ament_python</buildtool_depend>
 
-  <!-- Runtime dependencies -->
+  <!-- ========== Runtime dependencies ========== -->
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-
-  <!-- Optional but useful -->
   <exec_depend>message_filters</exec_depend>
 
-  <!-- For testing -->
+  <!-- Joystick -->
+  <exec_depend>joy</exec_depend>
+
+  <!-- Launch -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- ========== Test dependencies ========== -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
