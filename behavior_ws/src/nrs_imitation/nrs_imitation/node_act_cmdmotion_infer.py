@@ -10,20 +10,21 @@ Current training-side architecture:
   - fusion encoder
   - image encoder + ACT
 
-This node keeps the ROS topic interface unchanged, but updates inference-side
-preprocessing to match the new training structure:
+This node keeps the ROS topic interface mostly unchanged, but updates inference-side
+preprocessing to match the new single-camera training structure:
 
   qpos current  : [x y z wx wy wz fx fy fz]
   force_history : recent L-step force history (online buffer), normalized using
                   the same qpos force statistics as training dataset.py
 
-Stages / safety logic / topic names are kept the same as the previous version.
+Stages / safety logic are kept the same as the previous version. Only the image input is changed from two cameras to one camera (cam0).
 
 Usage:
 
 ros2 run nrs_imitation node_act_cmdmotion_infer --ros-args \
   -p act_root:=/home/eunseop/nrs_act \
   -p ckpt_dir:=/home/eunseop/nrs_act/checkpoints/ur10e_swing/20260317_0043 \
+  -p image_topic:=/realsense/vr/color/image_raw \
   -p use_force_history:=true \
   -p force_history_len:=10
 
@@ -121,34 +122,27 @@ def _img_to_rgb_numpy(msg: Image) -> np.ndarray:
 
 
 def _to_tensor_image_stack(
-    top_rgb: np.ndarray,
-    ee_rgb: np.ndarray,
+    cam0_rgb: np.ndarray,
     device: torch.device,
     resize_hw: int = 0,
 ) -> torch.Tensor:
     """
-    (H,W,3) -> (1,2,3,H,W) float in [0,1]
-    cam order fixed: [top, ee]
+    (H,W,3) -> (1,1,3,H,W) float in [0,1]
+    cam order fixed: [cam0]
     """
-    if top_rgb is None or ee_rgb is None:
-        raise RuntimeError("top/ee image is None")
+    if cam0_rgb is None:
+        raise RuntimeError("cam0 image is None")
 
     if resize_hw and resize_hw > 0:
         try:
             import cv2
-            top_rgb = cv2.resize(top_rgb, (resize_hw, resize_hw), interpolation=cv2.INTER_LINEAR)
-            ee_rgb = cv2.resize(ee_rgb, (resize_hw, resize_hw), interpolation=cv2.INTER_LINEAR)
+            cam0_rgb = cv2.resize(cam0_rgb, (resize_hw, resize_hw), interpolation=cv2.INTER_LINEAR)
         except Exception as e:
             raise RuntimeError(f"cv2 resize failed (resize_hw={resize_hw}): {e}")
-    else:
-        if top_rgb.shape != ee_rgb.shape:
-            raise RuntimeError(f"Top/Ee image size mismatch: top={top_rgb.shape}, ee={ee_rgb.shape}")
 
-    top = np.transpose(top_rgb, (2, 0, 1))
-    ee = np.transpose(ee_rgb, (2, 0, 1))
-
-    img = np.stack([top, ee], axis=0).astype(np.float32) / 255.0
-    img_t = torch.from_numpy(img).unsqueeze(0).to(device=device, dtype=torch.float32)  # (1,2,3,H,W)
+    cam0 = np.transpose(cam0_rgb, (2, 0, 1))
+    img = np.stack([cam0], axis=0).astype(np.float32) / 255.0
+    img_t = torch.from_numpy(img).unsqueeze(0).to(device=device, dtype=torch.float32)  # (1,1,3,H,W)
     return img_t
 
 
@@ -325,7 +319,7 @@ class Stage(Enum):
     PRELOAD = 1
     TRACK = 2
     RELEASE = 3
-    RECOVER = 4
+    RECOVER = 4  # deprecated / unused
 
 
 # ============================================================
@@ -394,8 +388,7 @@ class NodeActCmdMotionInfer(Node):
 
         self.declare_parameter("pose_topic", "/ur10skku/currentP")
         self.declare_parameter("force_topic", "/ur10skku/currentF")
-        self.declare_parameter("top_img_topic", "/realsense/top/color/image_raw")
-        self.declare_parameter("ee_img_topic", "/realsense/ee/color/image_raw")
+        self.declare_parameter("image_topic", "/realsense/vr/color/image_raw")
         self.declare_parameter("cmd_topic", "/ur10skku/cmdMotion")
 
         self.declare_parameter("image_qos", "best_effort")
@@ -541,8 +534,7 @@ class NodeActCmdMotionInfer(Node):
 
         self.pose_topic = str(self.get_parameter("pose_topic").value)
         self.force_topic = str(self.get_parameter("force_topic").value)
-        self.top_img_topic = str(self.get_parameter("top_img_topic").value)
-        self.ee_img_topic = str(self.get_parameter("ee_img_topic").value)
+        self.image_topic = str(self.get_parameter("image_topic").value)
         self.cmd_topic = str(self.get_parameter("cmd_topic").value)
 
         self.image_qos_str = str(self.get_parameter("image_qos").value)
@@ -620,7 +612,7 @@ class NodeActCmdMotionInfer(Node):
         self.fz_kick_dur_sec = float(self.get_parameter("fz_kick_dur_sec").value)
         self.fz_kick_cooldown_sec = float(self.get_parameter("fz_kick_cooldown_sec").value)
 
-        self.recover_enable = bool(self.get_parameter("recover_enable").value)
+        self.recover_enable = False  # RECOVER logic removed
         self.recover_cooldown_sec = float(self.get_parameter("recover_cooldown_sec").value)
         self.recover_timeout_sec = float(self.get_parameter("recover_timeout_sec").value)
         self.recover_pos_tol_mm = float(self.get_parameter("recover_pos_tol_mm").value)
@@ -689,8 +681,7 @@ class NodeActCmdMotionInfer(Node):
         self._lock = threading.Lock()
         self._pose6: Optional[np.ndarray] = None
         self._force: Optional[np.ndarray] = None
-        self._img_top: Optional[np.ndarray] = None
-        self._img_ee: Optional[np.ndarray] = None
+        self._img_cam0: Optional[np.ndarray] = None
 
         self._force_hist: Deque[np.ndarray] = deque(maxlen=max(1, self.force_history_len))
 
@@ -765,8 +756,7 @@ class NodeActCmdMotionInfer(Node):
 
         self.create_subscription(Float64MultiArray, self.pose_topic, self._on_pose, vec_qos)
         self.create_subscription(Float64MultiArray, self.force_topic, self._on_force, vec_qos)
-        self.create_subscription(Image, self.top_img_topic, self._on_top_img, img_qos)
-        self.create_subscription(Image, self.ee_img_topic, self._on_ee_img, img_qos)
+        self.create_subscription(Image, self.image_topic, self._on_img, img_qos)
 
         self.pub_cmd = self.create_publisher(Float64MultiArray, self.cmd_topic, 10)
 
@@ -778,8 +768,7 @@ class NodeActCmdMotionInfer(Node):
             f"  stage_start={self.stage.name}\n"
             f"  pose_topic={self.pose_topic}\n"
             f"  force_topic={self.force_topic}\n"
-            f"  top_img_topic={self.top_img_topic}\n"
-            f"  ee_img_topic={self.ee_img_topic}\n"
+            f"  image_topic={self.image_topic}\n"
             f"  cmd_topic={self.cmd_topic}\n"
             f"  image_qos={self.image_qos_str}\n"
             f"  control_hz={self.control_hz} infer_hz={self.infer_hz}\n"
@@ -792,7 +781,7 @@ class NodeActCmdMotionInfer(Node):
             f"  PRELOAD(src={self.preload_target_source}, min={self.preload_min_N}N, scale={self.preload_target_scale}, tol={self.preload_tol_N}N, ok={self.preload_ok_count}, timeout={self.preload_timeout_sec}s, kp={self.preload_kp_mm_per_N}mm/N, dz_max={self.preload_dz_max_mm}mm, fcmd={self.press_force_cmd_mode})\n"
             f"  STALL(win_sec={self.stall_sec}, min_after={self.stall_min_after_start_sec}s, lpf_tau={self.stall_lpf_tau_sec}s, net_eps_pos={self.stall_window_net_pos_eps_mm}mm, net_eps_ang={self.stall_window_net_ang_eps_rad}rad)\n"
             f"  KICK(fz={self.fz_kick_N}N/{self.fz_kick_dur_sec}s, cooldown={self.fz_kick_cooldown_sec}s)\n"
-            f"  RECOVER(enable={int(self.recover_enable)}, cooldown={self.recover_cooldown_sec}s, timeout={self.recover_timeout_sec}s, tol_pos={self.recover_pos_tol_mm}mm, tol_ang={self.recover_ang_tol_rad}rad, ok={self.recover_ok_count})\n"
+            f"  RECOVER(removed)\n"
             f"  DITHER(enable={int(self.dither_enable)}, only_track={int(self.dither_only_track)}, min_after={self.dither_min_after_start_sec}s, win={self.dither_win_sec}s, dur={self.dither_sec}s, net_pos_thr={self.dither_net_pos_thr_mm}mm, ratio_thr={self.dither_path_ratio_thr}, rms_pos_thr={self.dither_rms_pos_thr_mm}mm)\n"
             f"  RELEASE(enable={int(self.release_assist_enable)}, ramp_sec={self.release_ramp_sec})\n"
         )
@@ -860,7 +849,7 @@ class NodeActCmdMotionInfer(Node):
             "dec_layers": int(self.get_parameter("dec_layers").value),
             "nheads": int(self.get_parameter("nheads").value),
 
-            "camera_names": ["cam_top", "cam_ee"],
+            "camera_names": ["cam0"],
             "state_dim": 9,
             "action_dim": 9,
 
@@ -911,7 +900,7 @@ class NodeActCmdMotionInfer(Node):
             f"[INFO] Loaded ckpt from {ckpt_path}. missing={len(missing)}, unexpected={len(unexpected)}"
         )
         self.get_logger().info(
-            f"[INFO] camera_names=['cam_top','cam_ee'], use_force_history={self.use_force_history}, "
+            f"[INFO] camera_names=['cam0'], use_force_history={self.use_force_history}, "
             f"force_history_len={self.force_history_len}"
         )
         return policy
@@ -932,21 +921,13 @@ class NodeActCmdMotionInfer(Node):
             if arr.size >= 3:
                 self._force_hist.append(self._extract_force3(arr))
 
-    def _on_top_img(self, msg: Image):
+    def _on_img(self, msg: Image):
         try:
             rgb = _img_to_rgb_numpy(msg)
             with self._lock:
-                self._img_top = rgb
+                self._img_cam0 = rgb
         except Exception as e:
-            self.get_logger().error(f"[TOP IMG] decode failed: {e}")
-
-    def _on_ee_img(self, msg: Image):
-        try:
-            rgb = _img_to_rgb_numpy(msg)
-            with self._lock:
-                self._img_ee = rgb
-        except Exception as e:
-            self.get_logger().error(f"[EE IMG] decode failed: {e}")
+            self.get_logger().error(f"[CAM0 IMG] decode failed: {e}")
 
     # ------------------------------------------------------------
     # Contact update
@@ -1025,13 +1006,8 @@ class NodeActCmdMotionInfer(Node):
             f"[STAGE] -> RELEASE (fz ramp {self._release_start_fz_cmd:.3f} -> 0 in {self.release_ramp_sec:.2f}s)"
         )
 
-    def _enter_recover(self, pose6_now: Optional[np.ndarray] = None):
-        if self._start_pose6 is None:
-            return
-        self.stage = Stage.RECOVER
-        self._recover_t0 = _monotonic()
-        self._recover_ok = 0
-
+    def _soft_reset_to_approach(self, reason: str):
+        self.stage = Stage.APPROACH
         self.plans.clear()
         self._anchor_ready = False
         self._touch_ok = 0
@@ -1040,45 +1016,27 @@ class NodeActCmdMotionInfer(Node):
         self._stall_win_pose6 = None
         self._stall_win_t0 = _monotonic()
         self._stall_pose6_lpf = None
-
         self._recover_pose6_lpf = None
 
         self._reset_dither()
         self._reset_kick_count()
 
-        timeout_base = float(self.recover_timeout_sec)
-        timeout_eff = timeout_base
-        try:
-            if pose6_now is not None and self._start_pose6 is not None:
-                dist_mm = float(np.linalg.norm(pose6_now[:3] - self._start_pose6[:3]))
-                cap_mm = float(self.recover_step_cap_pos_mm if self.recover_use_overrides else self.step_cap_pos_mm)
-                v_mmps = max(1e-6, cap_mm * self.control_hz)
-                t_need = dist_mm / v_mmps
-                timeout_eff = max(timeout_base, self.recover_timeout_scale * t_need + self.recover_timeout_min_margin_sec)
-        except Exception:
-            timeout_eff = timeout_base
-        self._recover_timeout_eff = float(timeout_eff)
-
-        self.get_logger().warn(
-            "[STAGE] -> RECOVER (go back to start pose, clear plans/anchor, restart inference)\n"
-            f"         recover_timeout_eff={self._recover_timeout_eff:.2f}s"
-        )
+        self.get_logger().warn(f"[APPROACH-RESET] {reason} -> clear plans/anchor and continue APPROACH (RECOVER removed)")
 
     # ------------------------------------------------------------
     # Infer timer
     # ------------------------------------------------------------
     def _on_infer_timer(self):
-        if self.stage in (Stage.PRELOAD, Stage.RECOVER):
+        if self.stage == Stage.PRELOAD:
             return
 
         with self._lock:
             pose6 = None if self._pose6 is None else self._pose6.copy()
             force = None if self._force is None else self._force.copy()
-            top = None if self._img_top is None else self._img_top.copy()
-            ee = None if self._img_ee is None else self._img_ee.copy()
+            cam0 = None if self._img_cam0 is None else self._img_cam0.copy()
             force_hist_list = list(self._force_hist)
 
-        if pose6 is None or force is None or top is None or ee is None:
+        if pose6 is None or force is None or cam0 is None:
             return
         if force.size < 3:
             return
@@ -1099,7 +1057,7 @@ class NodeActCmdMotionInfer(Node):
                 force_hist_t = _normalize_force_history(force_hist_t, self.stats)
 
         try:
-            img_t = _to_tensor_image_stack(top, ee, device=self.device, resize_hw=self.resize_hw)
+            img_t = _to_tensor_image_stack(cam0, device=self.device, resize_hw=self.resize_hw)
         except Exception as e:
             self.get_logger().error(f"[INFER] image stack failed: {e}")
             return
@@ -1313,7 +1271,7 @@ class NodeActCmdMotionInfer(Node):
             return False
         if elapsed_since_start < self.dither_min_after_start_sec:
             return False
-        if self.stage in (Stage.PRELOAD, Stage.RELEASE, Stage.RECOVER):
+        if self.stage in (Stage.PRELOAD, Stage.RELEASE):
             return False
         if self.dither_only_track and (self.stage != Stage.TRACK):
             return False
@@ -1438,68 +1396,6 @@ class NodeActCmdMotionInfer(Node):
                     self.get_logger().warn(f"[PRELOAD] TIMEOUT {self.preload_timeout_sec:.2f}s (meas_fz={meas_fz:.2f}) -> TRACK anyway")
                     self._enter_track()
 
-        elif self.stage == Stage.RECOVER:
-            tgt6 = self._start_pose6 if self._start_pose6 is not None else pose6.astype(np.float32)
-            cmd_target = np.zeros(9, dtype=np.float32)
-            cmd_target[0:6] = tgt6.astype(np.float32)
-            cmd_target[6] = 0.0
-            cmd_target[7] = 0.0
-            cmd_target[8] = 0.0
-
-            beta_chk = _beta_from_tau(self.dt_control, self.recover_check_lpf_tau_sec)
-            if self._recover_pose6_lpf is None:
-                self._recover_pose6_lpf = pose6.astype(np.float32).copy()
-            else:
-                self._recover_pose6_lpf = (
-                    self._recover_pose6_lpf + beta_chk * (pose6.astype(np.float32) - self._recover_pose6_lpf)
-                ).astype(np.float32)
-
-            pchk = self._recover_pose6_lpf
-
-            ep = float(np.linalg.norm(pchk[:3] - tgt6[:3]))
-            ea = float(np.linalg.norm(pchk[3:6] - tgt6[3:6]))
-
-            if (ep <= self.recover_pos_tol_mm) and (ea <= self.recover_ang_tol_rad):
-                self._recover_ok += 1
-            else:
-                self._recover_ok = max(0, self._recover_ok - 1)
-
-            if self._recover_ok >= self.recover_ok_count:
-                self.stage = Stage.APPROACH
-                self.plans.clear()
-                self._anchor_ready = False
-                self._touch_ok = 0
-                self._fz_kick_active = False
-                self._recover_last_end_t = now_t
-
-                self._stall_pose6_lpf = None
-                self._stall_win_pose6 = None
-                self._stall_win_t0 = now_t
-
-                self._recover_pose6_lpf = None
-                self._reset_dither()
-                self._reset_kick_count()
-
-                self.get_logger().warn("[RECOVER] reached start pose -> APPROACH (resume inference)")
-            else:
-                if (now_t - self._recover_t0) >= self._recover_timeout_eff:
-                    self.stage = Stage.APPROACH
-                    self.plans.clear()
-                    self._anchor_ready = False
-                    self._touch_ok = 0
-                    self._fz_kick_active = False
-                    self._recover_last_end_t = now_t
-
-                    self._stall_pose6_lpf = None
-                    self._stall_win_pose6 = None
-                    self._stall_win_t0 = now_t
-
-                    self._recover_pose6_lpf = None
-                    self._reset_dither()
-                    self._reset_kick_count()
-
-                    self.get_logger().warn("[RECOVER] TIMEOUT -> APPROACH (resume inference)")
-
         else:
             cmd_pred = self._temporal_agg_cmd(now_t)
 
@@ -1548,17 +1444,17 @@ class NodeActCmdMotionInfer(Node):
             can_check_stall = (elapsed_since_start >= self.stall_min_after_start_sec)
             stalled = can_check_stall and (stall_win_age >= self.stall_sec)
 
-            if stalled and (self.stage not in (Stage.PRELOAD, Stage.RELEASE, Stage.RECOVER)):
+            if stalled and (self.stage not in (Stage.PRELOAD, Stage.RELEASE)):
                 if self._contact:
                     if self.recover_enable and (self._kick_count >= self.kick_max_before_recover) and ((now_t - self._recover_last_end_t) >= self.recover_cooldown_sec):
-                        self.get_logger().warn(f"[STALL] contact=1 but kick_count={self._kick_count} >= {self.kick_max_before_recover} -> RECOVER")
-                        self._enter_recover(pose6_now=pose6.astype(np.float32))
+                        self.get_logger().warn(f"[STALL] contact=1 but kick_count={self._kick_count} >= {self.kick_max_before_recover} -> APPROACH reset (RECOVER removed)")
+                        self._soft_reset_to_approach("STALL contact=1 kick limit")
                     else:
                         self._try_start_kick(now_t, reason="STALL", age_sec=stall_win_age)
                 else:
                     if self.recover_enable and ((now_t - self._recover_last_end_t) >= self.recover_cooldown_sec):
-                        self.get_logger().warn(f"[STALL] (contact=0) window_age={stall_win_age:.2f}s -> RECOVER start")
-                        self._enter_recover(pose6_now=pose6.astype(np.float32))
+                        self.get_logger().warn(f"[STALL] (contact=0) window_age={stall_win_age:.2f}s -> APPROACH reset (RECOVER removed)")
+                        self._soft_reset_to_approach("STALL contact=0")
 
             if self._fz_kick_active and ((now_t - self._fz_kick_t0) >= self.fz_kick_dur_sec):
                 self._fz_kick_active = False
@@ -1577,17 +1473,17 @@ class NodeActCmdMotionInfer(Node):
             if dither_age >= self.dither_sec:
                 if self._contact:
                     if self.recover_enable and (self._kick_count >= self.kick_max_before_recover) and ((now_t - self._recover_last_end_t) >= self.recover_cooldown_sec):
-                        self.get_logger().warn(f"[DITHER] contact=1 and kick_count={self._kick_count} >= {self.kick_max_before_recover} -> RECOVER")
-                        self._enter_recover(pose6_now=pose6.astype(np.float32))
+                        self.get_logger().warn(f"[DITHER] contact=1 and kick_count={self._kick_count} >= {self.kick_max_before_recover} -> APPROACH reset (RECOVER removed)")
+                        self._soft_reset_to_approach("DITHER contact=1 kick limit")
                     else:
                         started = self._try_start_kick(now_t, reason="DITHER", age_sec=dither_age)
                         if not started and self.recover_enable and ((now_t - self._recover_last_end_t) >= self.recover_cooldown_sec) and (self._kick_count >= self.kick_max_before_recover):
-                            self.get_logger().warn("[DITHER] kick cooldown but kick limit reached -> RECOVER")
-                            self._enter_recover(pose6_now=pose6.astype(np.float32))
+                            self.get_logger().warn("[DITHER] kick cooldown but kick limit reached -> APPROACH reset (RECOVER removed)")
+                            self._soft_reset_to_approach("DITHER cooldown + kick limit")
                 else:
                     if self.recover_enable and ((now_t - self._recover_last_end_t) >= self.recover_cooldown_sec):
-                        self.get_logger().warn(f"[DITHER] contact=0 age={dither_age:.2f}s -> RECOVER start")
-                        self._enter_recover(pose6_now=pose6.astype(np.float32))
+                        self.get_logger().warn(f"[DITHER] contact=0 age={dither_age:.2f}s -> APPROACH reset (RECOVER removed)")
+                        self._soft_reset_to_approach("DITHER contact=0")
 
                 self._reset_dither()
 
@@ -1680,12 +1576,10 @@ class NodeActCmdMotionInfer(Node):
         if (int(now_t * self.control_hz) % self.debug_every_n) == 0:
             base = self._fz_base if self._fz_base_init else 0.0
             touch_sig = max(0.0, meas_fz - base) if self.touch_use_delta else max(0.0, meas_fz)
-            recover_en = int(self.recover_enable)
-
             self.get_logger().info(
                 f"[CTRL] stage={self.stage.name} contact={int(self._contact)} meas_fz={meas_fz:.3f} "
                 f"fz_base={base:.3f} touch_sig={touch_sig:.3f} touch_ok={self._touch_ok} | "
-                f"stall_win={stall_win_age:.2f}s dither={dither_age:.2f}s kickN={int(self._fz_kick_active)} kickCnt={self._kick_count} recover_en={recover_en} | "
+                f"stall_win={stall_win_age:.2f}s dither={dither_age:.2f}s kickN={int(self._fz_kick_active)} kickCnt={self._kick_count} | "
                 f"beta={beta:.4f} ramp={ramp:.3f} cap(pos={cap_pos:.4f}, ang={cap_ang:.6f}, fz={cap_fz:.4f}) | "
                 f"cmd_xyz=[{cmd_next[0]:.3f},{cmd_next[1]:.3f},{cmd_next[2]:.3f}] cmd_fz={cmd_next[8]:.3f}"
             )

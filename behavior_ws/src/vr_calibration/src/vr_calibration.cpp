@@ -174,7 +174,7 @@ public:
     // Files
     // ----------------------------
     waypoint_file_ =
-      "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/vr_calibration/for_vr_calibration_point_v2.txt";
+      "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/vr_calibration/for_vr_calibration_point.txt";
 
     ee_path_ =
       "/home/eunseop/dev_ws/src/y2_ur10skku_control/Y2RobMotion/vr_calibration/ur10_ee.txt";

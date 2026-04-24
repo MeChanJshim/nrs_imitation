@@ -471,10 +471,18 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     # force history dataset / GRU observation encoder
     # ------------------------------------------------------------
+    p.set_defaults(use_force_history=True)
     p.add_argument(
         "--use_force_history",
+        dest="use_force_history",
         action="store_true",
-        help="dataset에서 on-the-fly force history를 만들어 policy/model까지 전달",
+        help="enable force history input (default: enabled)",
+    )
+    p.add_argument(
+        "--no_force_history",
+        dest="use_force_history",
+        action="store_false",
+        help="disable force history input",
     )
     p.add_argument(
         "--force_history_len",
@@ -514,6 +522,10 @@ if __name__ == "__main__":
         remove_flags.append("--temporal_agg")
     if not getattr(args, "temporal_agg", True):
         remove_flags.append("--no_temporal_agg")
+    if getattr(args, "use_force_history", False):
+        remove_flags.append("--use_force_history")
+    if not getattr(args, "use_force_history", True):
+        remove_flags.append("--no_force_history")
 
     if remove_flags:
         sys.argv = [a for a in sys.argv if a not in remove_flags]
