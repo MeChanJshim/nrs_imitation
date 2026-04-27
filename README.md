@@ -136,34 +136,63 @@ Use whichever force node matches your current setup.
 
 ### C. Camera node
 
-For the VR teaching camera:
+`rsv` and `rsr` are aliases of the following RealSense launch helper functions.
+
+#### VR camera launch helper (`rs_vr`)
+
+Use this when bringing up the VR-side camera (`camera_name:=vr`) in RGB-only mode.
+
+Default:
+- `640x480@30`
+
+Function:
 
 ```bash
-alias rsv='rs_vr'
+rs_vr() {
+  local profile="${1:-$RS_VR_PROFILE_DEFAULT}"
+  ros2 launch realsense2_camera rs_launch.py     camera_namespace:="$RS_NS" camera_name:=vr     serial_no:="'243622073271'"     $(_rs_common_args)     rgb_camera.profile:="${profile}"
+}
 ```
 
-Run:
+Usage:
 
 ```bash
 rsv
+rsv 640x480x15
 ```
 
-For the robot camera:
-
-```bash
-alias rsr='rs_robot'
-```
-
-Run:
-
-```bash
-rsr
-```
-
-Typical image topics:
+Expected image topic:
 
 ```text
 /realsense/vr/color/image_raw
+```
+
+#### Robot camera launch helper (`rs_robot`)
+
+Use this when bringing up the robot-side / end-effector camera (`camera_name:=robot`) in RGB-only mode.
+
+Default:
+- `640x480@15`  (more stable on USB2.1)
+
+Function:
+
+```bash
+rs_robot() {
+  local profile="${1:-$RS_ROBOT_PROFILE_DEFAULT}"
+  ros2 launch realsense2_camera rs_launch.py     camera_namespace:="$RS_NS" camera_name:=robot     serial_no:="'244222070489'"     $(_rs_common_args)     rgb_camera.profile:="${profile}"
+}
+```
+
+Usage:
+
+```bash
+rsr
+rsr 424x240x30
+```
+
+Expected image topic:
+
+```text
 /realsense/robot/color/image_raw
 ```
 
