@@ -1,430 +1,295 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-diffusion_core.py
-
-Diffusion-policy style visuomotor policy core for the current nrs_act codebase.
-
-Design goals:
-- Keep existing dataset format:
-    observation = position(6) + force(3) + image(s)
-    action      = position(6) + force(3)
-- Reuse existing modular components when possible:
-    * backbone.py
-    * encoder.py
-- Keep train/eval entrypoint logic thin and delegated to source/
-
-This implementation follows the core idea of action diffusion:
-  noisy action chunk + observation conditioning -> predict noise
-and uses iterative denoising at inference time.
-
-It is intentionally lightweight and easy to integrate into the current ACT-based codebase.
-"""
-
-from types import SimpleNamespace
-from typing import Optional
+from __future__ import annotations
 
 import math
+from typing import Iterable, Optional, Sequence, Tuple
+
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
-from .backbone import build_backbone
-from .encoder import PositionForceObservationEncoder
-
-
-def _build_args(args_override: dict) -> SimpleNamespace:
-    defaults = dict(
-        # optimizer
-        lr=1e-4,
-        lr_backbone=1e-5,
-        weight_decay=1e-4,
-        # backbone
-        backbone="resnet18",
-        dilation=False,
-        position_embedding="sine",
-        camera_names=["cam0"],
-        pretrained_backbone=True,
-        # general dims
-        hidden_dim=512,
-        dim_feedforward=3200,
-        dropout=0.1,
-        nheads=8,
-        enc_layers=4,
-        dec_layers=7,
-        pre_norm=False,
-        masks=False,
-        state_dim=9,
-        action_dim=9,
-        position_dim=6,
-        force_dim=3,
-        # observation encoder
-        position_encoder_hidden_dim=128,
-        force_encoder_hidden_dim=64,
-        force_encoder_num_layers=1,
-        force_encoder_dropout=0.0,
-        observation_encoder_activation="gelu",
-        # diffusion-specific
-        num_queries=200,
-        diffusion_train_steps=100,
-        diffusion_infer_steps=10,
-        diffusion_beta_start=1e-4,
-        diffusion_beta_end=2e-2,
-        diffusion_loss_type="mse",
-        image_resize_hw=256,
-        image_pool_hw=4,
-    )
-    defaults.update(args_override)
-    return SimpleNamespace(**defaults)
+try:
+    from torchvision.models import resnet18, ResNet18_Weights
+except Exception:
+    from torchvision.models import resnet18  # type: ignore
+    ResNet18_Weights = None  # type: ignore
 
 
-class SinusoidalTimeEmbedding(nn.Module):
+def _parse_down_dims(v) -> Tuple[int, ...]:
+    if isinstance(v, str):
+        return tuple(int(x.strip()) for x in v.split(",") if x.strip())
+    if isinstance(v, Iterable):
+        return tuple(int(x) for x in v)
+    raise TypeError(f"Unsupported down_dims type: {type(v)}")
+
+
+class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = int(dim)
 
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """
-        timesteps: (B,) int or float
-        returns:   (B, dim)
-        """
-        if timesteps.dim() == 0:
-            timesteps = timesteps[None]
-        timesteps = timesteps.float()
-        half = self.dim // 2
-        device = timesteps.device
-
-        emb_scale = math.log(10000.0) / max(half - 1, 1)
-        emb = torch.exp(torch.arange(half, device=device, dtype=torch.float32) * (-emb_scale))
-        emb = timesteps[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        half_dim = self.dim // 2
+        if half_dim == 0:
+            return x[:, None]
+        emb_scale = math.log(10000.0) / max(half_dim - 1, 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb_scale)
+        emb = x[:, None].float() * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
         if self.dim % 2 == 1:
-            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+            emb = F.pad(emb, (0, 1))
         return emb
 
 
-class ImageConditionEncoder(nn.Module):
-    """
-    Reuses backbone.py and produces one global image-conditioning vector per batch item.
-    """
-
-    def __init__(self, backbones, camera_names, hidden_dim: int):
+class Downsample1d(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        self.camera_names = list(camera_names)
-        self.backbones = nn.ModuleList(backbones)
+        self.conv = nn.Conv1d(dim, dim, kernel_size=4, stride=2, padding=1)
 
-        shared_num_channels = backbones[0].num_channels
-        self.cam_proj = nn.ModuleList([
-            nn.Linear(shared_num_channels, hidden_dim) for _ in self.camera_names
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Upsample1d(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv1dBlock(nn.Module):
+    def __init__(self, inp_dim: int, out_dim: int, kernel_size: int = 3, n_groups: int = 8):
+        super().__init__()
+        padding = kernel_size // 2
+        g = min(n_groups, out_dim)
+        while out_dim % g != 0 and g > 1:
+            g -= 1
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_dim, out_dim, kernel_size=kernel_size, padding=padding),
+            nn.GroupNorm(g, out_dim),
+            nn.Mish(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class ConditionalResidualBlock1D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int,
+                 kernel_size: int = 3, n_groups: int = 8, cond_predict_scale: bool = False):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
         ])
-        self.fuse = nn.Sequential(
-            nn.Linear(hidden_dim * len(self.camera_names), hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        cond_channels = out_channels * 2 if cond_predict_scale else out_channels
+        self.cond_predict_scale = bool(cond_predict_scale)
+        self.out_channels = int(out_channels)
+        self.cond_encoder = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, cond_channels))
+        self.residual_conv = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        image: (B,K,3,H,W)
-        returns: (B, hidden_dim)
-        """
-        if image.dim() == 6:
-            image = image[:, 0, ...]
-        if image.dim() != 5:
-            raise ValueError(f"image must be (B,K,3,H,W), got {tuple(image.shape)}")
-
-        B = image.size(0)
-        feats = []
-        shared = len(self.backbones) == 1
-
-        for cam_id, _ in enumerate(self.camera_names):
-            backbone = self.backbones[0] if shared else self.backbones[cam_id]
-            xs, _ = backbone(image[:, cam_id])
-            x = xs[0]                            # (B,C,H,W)
-            x = x.mean(dim=(-2, -1))            # GAP -> (B,C)
-            x = self.cam_proj[cam_id](x)        # (B,H)
-            feats.append(x)
-
-        fused = torch.cat(feats, dim=-1) if len(feats) > 1 else feats[0]
-        if fused.dim() == 1:
-            fused = fused.view(B, -1)
-        return self.fuse(fused)
-
-
-class DiffusionTransformerCore(nn.Module):
-    """
-    Diffusion-policy style conditional transformer denoiser.
-
-    Conditioning:
-      - PositionForceObservationEncoder for qpos / force_history
-      - ImageConditionEncoder for camera input
-      - timestep embedding
-    Target:
-      - predict Gaussian noise on future action chunk
-    """
-
-    def __init__(
-        self,
-        backbones,
-        camera_names,
-        hidden_dim: int,
-        dim_feedforward: int,
-        nheads: int,
-        num_layers: int,
-        action_dim: int,
-        horizon: int,
-        position_dim: int = 6,
-        force_dim: int = 3,
-        position_encoder_hidden_dim: int = 128,
-        force_encoder_hidden_dim: int = 64,
-        force_encoder_num_layers: int = 1,
-        force_encoder_dropout: float = 0.0,
-        observation_encoder_activation: str = "gelu",
-        diffusion_train_steps: int = 100,
-        diffusion_infer_steps: int = 10,
-        diffusion_beta_start: float = 1e-4,
-        diffusion_beta_end: float = 2e-2,
-    ):
-        super().__init__()
-        self.camera_names = list(camera_names)
-        self.hidden_dim = int(hidden_dim)
-        self.action_dim = int(action_dim)
-        self.horizon = int(horizon)
-        self.diffusion_train_steps = int(diffusion_train_steps)
-        self.diffusion_infer_steps = int(diffusion_infer_steps)
-
-        self.observation_encoder = PositionForceObservationEncoder(
-            position_dim=position_dim,
-            force_dim=force_dim,
-            position_hidden_dim=position_encoder_hidden_dim,
-            force_gru_hidden_dim=force_encoder_hidden_dim,
-            force_gru_num_layers=force_encoder_num_layers,
-            force_gru_dropout=force_encoder_dropout,
-            output_dim=hidden_dim,
-            activation=observation_encoder_activation,
-        )
-        self.image_encoder = ImageConditionEncoder(
-            backbones=backbones,
-            camera_names=camera_names,
-            hidden_dim=hidden_dim,
-        )
-        self.cond_fuse = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self.time_embed = nn.Sequential(
-            SinusoidalTimeEmbedding(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self.action_in = nn.Linear(action_dim, hidden_dim)
-        self.action_out = nn.Linear(hidden_dim, action_dim)
-        self.seq_pos = nn.Embedding(horizon, hidden_dim)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=nheads,
-            dim_feedforward=dim_feedforward,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=False,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.final_norm = nn.LayerNorm(hidden_dim)
-
-        betas = torch.linspace(
-            float(diffusion_beta_start),
-            float(diffusion_beta_end),
-            self.diffusion_train_steps,
-            dtype=torch.float32,
-        )
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bars", alpha_bars)
-        self.register_buffer("sqrt_alpha_bars", torch.sqrt(alpha_bars))
-        self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt(1.0 - alpha_bars))
-
-    def _global_condition(self, qpos, image, force_history=None) -> torch.Tensor:
-        obs_cond = self.observation_encoder(qpos=qpos, force_history=force_history)
-        img_cond = self.image_encoder(image)
-        return self.cond_fuse(torch.cat([obs_cond, img_cond], dim=-1))
-
-    def denoise(self, noisy_actions, timesteps, qpos, image, force_history=None):
-        """
-        noisy_actions: (B,T,A)
-        timesteps:     (B,)
-        returns:       predicted noise (B,T,A)
-        """
-        B, T, A = noisy_actions.shape
-        if A != self.action_dim:
-            raise ValueError(f"action dim mismatch: {A} vs expected {self.action_dim}")
-        if T > self.horizon:
-            raise ValueError(f"sequence length {T} exceeds configured horizon {self.horizon}")
-
-        cond = self._global_condition(qpos, image, force_history=force_history)  # (B,H)
-        t_embed = self.time_embed(timesteps)                                     # (B,H)
-
-        x = self.action_in(noisy_actions)                                        # (B,T,H)
-
-        pos_ids = torch.arange(T, device=noisy_actions.device)
-        pos = self.seq_pos(pos_ids).unsqueeze(0).expand(B, T, self.hidden_dim)   # (B,T,H)
-
-        cond_tok = cond.unsqueeze(1).expand(B, T, self.hidden_dim)
-        time_tok = t_embed.unsqueeze(1).expand(B, T, self.hidden_dim)
-
-        x = x + pos + cond_tok + time_tok
-        x = self.transformer(x)
-        x = self.final_norm(x)
-        return self.action_out(x)
-
-    def diffusion_loss(self, qpos, image, actions, force_history=None, is_pad=None):
-        """
-        actions: (B,T,A)
-        is_pad:  (B,T)
-        """
-        B, T, A = actions.shape
-        device = actions.device
-
-        t = torch.randint(
-            low=0,
-            high=self.diffusion_train_steps,
-            size=(B,),
-            device=device,
-            dtype=torch.long,
-        )
-
-        noise = torch.randn_like(actions)
-        sqrt_ab = self.sqrt_alpha_bars[t].view(B, 1, 1)
-        sqrt_1mab = self.sqrt_one_minus_alpha_bars[t].view(B, 1, 1)
-        noisy_actions = sqrt_ab * actions + sqrt_1mab * noise
-
-        pred_noise = self.denoise(
-            noisy_actions=noisy_actions,
-            timesteps=t,
-            qpos=qpos,
-            image=image,
-            force_history=force_history,
-        )
-
-        if is_pad is None:
-            valid_mask = torch.ones((B, T, 1), dtype=torch.float32, device=device)
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        out = self.blocks[0](x)
+        embed = self.cond_encoder(cond)
+        if self.cond_predict_scale:
+            embed = embed.view(embed.shape[0], 2, self.out_channels, 1)
+            scale = embed[:, 0]
+            bias = embed[:, 1]
+            out = scale * out + bias
         else:
-            valid_mask = (~is_pad).unsqueeze(-1).float()
+            out = out + embed[:, :, None]
+        out = self.blocks[1](out)
+        return out + self.residual_conv(x)
 
-        return pred_noise, noise, valid_mask
 
-    @torch.no_grad()
-    def sample_actions(
-        self,
-        qpos,
-        image,
-        force_history=None,
-        horizon: Optional[int] = None,
-        inference_steps: Optional[int] = None,
-    ):
-        """
-        Deterministic DDIM-style sampling.
-        returns: (B,T,A)
-        """
-        device = qpos.device
-        B = qpos.shape[0]
-        T = int(horizon if horizon is not None else self.horizon)
-        inference_steps = int(inference_steps if inference_steps is not None else self.diffusion_infer_steps)
-        inference_steps = max(1, min(inference_steps, self.diffusion_train_steps))
+class DiffusionObservationEncoder(nn.Module):
+    def __init__(self, cfg: dict):
+        super().__init__()
+        qpos_dim = int(cfg.get("state_dim", 9))
+        force_dim = int(cfg.get("force_dim", 3))
+        force_hidden_dim = int(cfg.get("force_encoder_hidden_dim", 64))
+        force_num_layers = int(cfg.get("force_encoder_num_layers", 1))
+        force_dropout = float(cfg.get("force_encoder_dropout", 0.0))
+        obs_hidden_dim = int(cfg.get("diffusion_obs_hidden_dim", 256))
+        image_feature_dim = int(cfg.get("diffusion_image_feature_dim", 512))
+        global_cond_dim = int(cfg.get("diffusion_global_cond_dim", 256))
+        pretrained_backbone = bool(cfg.get("pretrained_backbone", True))
 
-        x = torch.randn(B, T, self.action_dim, device=device, dtype=torch.float32)
-
-        ts = torch.linspace(
-            self.diffusion_train_steps - 1,
-            0,
-            inference_steps,
-            device=device,
-            dtype=torch.long,
+        self.qpos_encoder = nn.Sequential(
+            nn.Linear(qpos_dim, obs_hidden_dim),
+            nn.LayerNorm(obs_hidden_dim),
+            nn.Mish(),
+            nn.Linear(obs_hidden_dim, obs_hidden_dim),
+            nn.Mish(),
         )
 
-        prev_t = None
-        for idx, t_scalar in enumerate(ts):
-            t = torch.full((B,), int(t_scalar.item()), device=device, dtype=torch.long)
-            eps = self.denoise(
-                noisy_actions=x,
-                timesteps=t,
-                qpos=qpos,
-                image=image,
-                force_history=force_history,
+        self.use_force_history = bool(cfg.get("use_force_history", False))
+        if self.use_force_history:
+            self.force_gru = nn.GRU(
+                input_size=force_dim,
+                hidden_size=force_hidden_dim,
+                num_layers=force_num_layers,
+                batch_first=True,
+                dropout=(force_dropout if force_num_layers > 1 else 0.0),
             )
+            force_out_dim = force_hidden_dim
+        else:
+            self.force_gru = None
+            force_out_dim = 0
 
-            alpha_bar_t = self.alpha_bars[t].view(B, 1, 1)
-            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-            sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
+        if ResNet18_Weights is not None:
+            weights = ResNet18_Weights.DEFAULT if pretrained_backbone else None
+            backbone = resnet18(weights=weights)
+        else:
+            backbone = resnet18(pretrained=pretrained_backbone)
 
-            x0 = (x - sqrt_one_minus_alpha_bar_t * eps) / torch.clamp(sqrt_alpha_bar_t, min=1e-6)
+        backbone.fc = nn.Identity()
+        self.image_backbone = backbone
+        self.image_proj = nn.Sequential(
+            nn.Linear(512, image_feature_dim),
+            nn.LayerNorm(image_feature_dim),
+            nn.Mish(),
+        )
 
-            if idx == len(ts) - 1:
-                x = x0
-                break
+        in_dim = obs_hidden_dim + force_out_dim + image_feature_dim
+        self.fuse = nn.Sequential(
+            nn.Linear(in_dim, global_cond_dim),
+            nn.LayerNorm(global_cond_dim),
+            nn.Mish(),
+            nn.Linear(global_cond_dim, global_cond_dim),
+        )
+        self.global_cond_dim = global_cond_dim
 
-            next_t_scalar = ts[idx + 1]
-            next_t = torch.full((B,), int(next_t_scalar.item()), device=device, dtype=torch.long)
-            alpha_bar_next = self.alpha_bars[next_t].view(B, 1, 1)
-
-            # deterministic DDIM update
-            x = torch.sqrt(alpha_bar_next) * x0 + torch.sqrt(1.0 - alpha_bar_next) * eps
-            prev_t = next_t
-
-        return x
-
-
-def build_diffusion_model(args):
-    backbones = [build_backbone(args) for _ in args.camera_names]
-
-    model = DiffusionTransformerCore(
-        backbones=backbones,
-        camera_names=args.camera_names,
-        hidden_dim=args.hidden_dim,
-        dim_feedforward=args.dim_feedforward,
-        nheads=args.nheads,
-        num_layers=args.enc_layers,
-        action_dim=getattr(args, "action_dim", 9),
-        horizon=getattr(args, "num_queries", 200),
-        position_dim=getattr(args, "position_dim", 6),
-        force_dim=getattr(args, "force_dim", 3),
-        position_encoder_hidden_dim=getattr(args, "position_encoder_hidden_dim", 128),
-        force_encoder_hidden_dim=getattr(args, "force_encoder_hidden_dim", 64),
-        force_encoder_num_layers=getattr(args, "force_encoder_num_layers", 1),
-        force_encoder_dropout=getattr(args, "force_encoder_dropout", 0.0),
-        observation_encoder_activation=getattr(args, "observation_encoder_activation", "gelu"),
-        diffusion_train_steps=getattr(args, "diffusion_train_steps", 100),
-        diffusion_infer_steps=getattr(args, "diffusion_infer_steps", 10),
-        diffusion_beta_start=getattr(args, "diffusion_beta_start", 1e-4),
-        diffusion_beta_end=getattr(args, "diffusion_beta_end", 2e-2),
-    )
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("number of parameters: %.2fM" % (n_params / 1e6,))
-    return model
+    def forward(self, qpos: torch.Tensor, image: torch.Tensor, force_history: Optional[torch.Tensor] = None) -> torch.Tensor:
+        q = self.qpos_encoder(qpos)
+        if image.dim() != 5:
+            raise RuntimeError(f"Expected image (B,K,3,H,W), got {tuple(image.shape)}")
+        cam0 = image[:, 0]
+        img_feat = self.image_proj(self.image_backbone(cam0))
+        feats = [q, img_feat]
+        if self.use_force_history and force_history is not None:
+            _, h = self.force_gru(force_history)
+            feats.append(h[-1])
+        return self.fuse(torch.cat(feats, dim=-1))
 
 
-def build_Diffusion_model_and_optimizer(args_override):
-    args = _build_args(args_override)
-    model = build_diffusion_model(args)
+class ConditionalUnet1D(nn.Module):
+    def __init__(self, input_dim: int, global_cond_dim: int, diffusion_step_embed_dim: int = 256,
+                 down_dims: Sequence[int] = (256, 512, 1024), kernel_size: int = 5,
+                 n_groups: int = 8, cond_predict_scale: bool = False):
+        super().__init__()
+        down_dims = list(down_dims)
+        all_dims = [input_dim] + down_dims
+        start_dim = down_dims[0]
 
-    param_dicts = [
-        {
-            "params": [p for n, p in model.named_parameters() if "backbones" not in n and p.requires_grad]
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if "backbones" in n and p.requires_grad],
-            "lr": args.lr_backbone,
-        },
-    ]
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+        self.diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(diffusion_step_embed_dim),
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
+        )
+        cond_dim = diffusion_step_embed_dim + global_cond_dim
+        self.input_proj = Conv1dBlock(input_dim, start_dim, kernel_size=kernel_size, n_groups=n_groups)
+
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
+        self.down_modules = nn.ModuleList()
+        prev_dim = start_dim
+        for ind, (_, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(prev_dim, dim_out, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                Downsample1d(dim_out) if not is_last else nn.Identity(),
+            ]))
+            prev_dim = dim_out
+
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList([
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups, cond_predict_scale),
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups, cond_predict_scale),
+        ])
+
+        rev_in_out = list(zip(reversed(all_dims[1:]), reversed(all_dims[:-1])))
+        self.up_modules = nn.ModuleList()
+        for ind, (dim_in, dim_out) in enumerate(rev_in_out[1:]):
+            is_last = ind >= (len(rev_in_out[1:]) - 1)
+            self.up_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(dim_in * 2, dim_out, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                Upsample1d(dim_out) if not is_last else nn.Identity(),
+            ]))
+
+        self.final_conv = nn.Sequential(
+            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size, n_groups=n_groups),
+            nn.Conv1d(start_dim, input_dim, kernel_size=1),
+        )
+
+    def forward(self, sample: torch.Tensor, timestep: torch.Tensor, global_cond: torch.Tensor) -> torch.Tensor:
+        x = sample.moveaxis(-1, -2)
+        x = self.input_proj(x)
+        t_emb = self.diffusion_step_encoder(timestep)
+        cond = torch.cat([t_emb, global_cond], dim=-1)
+
+        h = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, cond)
+            x = resnet2(x, cond)
+            h.append(x)
+            x = downsample(x)
+
+        for mid in self.mid_modules:
+            x = mid(x, cond)
+
+        for resnet, resnet2, upsample in self.up_modules:
+            skip = h.pop()
+            if x.shape[-1] != skip.shape[-1]:
+                m = min(x.shape[-1], skip.shape[-1])
+                x = x[..., :m]
+                skip = skip[..., :m]
+            x = torch.cat([x, skip], dim=1)
+            x = resnet(x, cond)
+            x = resnet2(x, cond)
+            x = upsample(x)
+
+        return self.final_conv(x).moveaxis(-1, -2)
+
+
+class DiffusionPolicyCore(nn.Module):
+    def __init__(self, cfg: dict):
+        super().__init__()
+        action_dim = int(cfg.get("action_dim", 9))
+        time_dim = int(cfg.get("diffusion_time_embed_dim", 256))
+        down_dims = _parse_down_dims(cfg.get("diffusion_down_dims", (256, 512, 1024)))
+        kernel_size = int(cfg.get("diffusion_kernel_size", 5))
+        n_groups = int(cfg.get("diffusion_n_groups", 8))
+        cond_predict_scale = bool(cfg.get("diffusion_cond_predict_scale", False))
+
+        self.obs_encoder = DiffusionObservationEncoder(cfg)
+        self.unet = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=self.obs_encoder.global_cond_dim,
+            diffusion_step_embed_dim=time_dim,
+            down_dims=down_dims,
+            kernel_size=kernel_size,
+            n_groups=n_groups,
+            cond_predict_scale=cond_predict_scale,
+        )
+
+    def forward(self, noisy_actions: torch.Tensor, timesteps: torch.Tensor,
+                qpos: torch.Tensor, image: torch.Tensor,
+                force_history: Optional[torch.Tensor] = None) -> torch.Tensor:
+        gc = self.obs_encoder(qpos=qpos, image=image, force_history=force_history)
+        return self.unet(sample=noisy_actions, timestep=timesteps, global_cond=gc)
+
+
+def build_DIFFUSION_model_and_optimizer(args_override: dict):
+    model = DiffusionPolicyCore(args_override)
+    lr = float(args_override.get("lr", 1e-4))
+    weight_decay = float(args_override.get("weight_decay", 1e-6))
+    betas = tuple(args_override.get("optimizer_betas", (0.95, 0.999)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=betas)
     return model, optimizer
