@@ -31,6 +31,7 @@ ros2 run nrs_imitation node_act_cmdmotion_infer --ros-args \
 
 """
 
+
 import os
 import sys
 import time
