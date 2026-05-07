@@ -3,7 +3,7 @@
 """
 train_flow.py
 
-RGB-conditioned Flow Matching training script for nrs_act.
+RGB-conditioned Flow Matching training script for nrs_imitation.
 
 This is the first-stage Flow RGB baseline:
     - Use the existing ACT-compatible HDF5 dataset.
@@ -15,13 +15,13 @@ This is the first-stage Flow RGB baseline:
     - Low-level admittance controller remains unchanged.
 
 Default dataset:
-    /home/eunseop/nrs_act/datasets/ACT/<latest_timestamp>/episodes_ft
+    /home/eunseop/nrs_imitation/datasets/ACT/<latest_timestamp>/episodes_ft
 
 Default checkpoint:
-    /home/eunseop/nrs_act/checkpoints/flow/ur10e_swing/<timestamp>
+    /home/eunseop/nrs_imitation/checkpoints/flow/ur10e_swing/<timestamp>
 
 Run:
-    cd ~/nrs_act
+    cd ~/nrs_imitation
     python3 scripts/flow/train_flow.py
 
 Eval-load check:
@@ -91,7 +91,7 @@ def _count_episodes(dataset_dir: str) -> int:
 
 
 def find_latest_episode_dir(
-    root_dir: str = "/home/eunseop/nrs_act/datasets/ACT",
+    root_dir: str = "/home/eunseop/nrs_imitation/datasets/ACT",
     subdir_name: str = "episodes_ft",
 ) -> str:
     root = Path(root_dir).expanduser()
@@ -147,7 +147,7 @@ def resolve_dataset_dir(dataset_dir: Optional[str], cam_preprocess: str, task_na
             return resolved
 
     latest = find_latest_episode_dir(
-        root_dir="/home/eunseop/nrs_act/datasets/ACT",
+        root_dir="/home/eunseop/nrs_imitation/datasets/ACT",
         subdir_name=subdir_name,
     )
     print(f"[AUTO] dataset_dir not provided -> using latest {subdir_name}: {latest}")
@@ -719,7 +719,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--task_name", type=str, default="ur10e_swing")
-    parser.add_argument("--ckpt_dir", type=str, default="/home/eunseop/nrs_act/checkpoints/flow/ur10e_swing")
+    parser.add_argument("--ckpt_dir", type=str, default="/home/eunseop/nrs_imitation/checkpoints/flow/ur10e_swing")
 
     parser.add_argument("--dataset_dir", type=str, default=None)
     parser.add_argument("--cam_preprocess", type=str, default="stabilize_crop", choices=["off", "stabilize_crop"])

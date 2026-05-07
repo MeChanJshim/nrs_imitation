@@ -23,8 +23,8 @@ Stages / safety logic are kept the same as the previous version. Only the image 
 Usage:
 
 ros2 run nrs_imitation node_act_cmdmotion_infer --ros-args \
-  -p act_root:=/home/eunseop/nrs_act \
-  -p ckpt_dir:=/home/eunseop/nrs_act/checkpoints/ur10e_swing/20260317_0043 \
+  -p act_root:=/home/eunseop/nrs_imitation \
+  -p ckpt_dir:=/home/eunseop/nrs_imitation/checkpoints/ur10e_swing/20260317_0043 \
   -p image_topic:=/realsense/vr/color/image_raw \
   -p use_force_history:=true \
   -p force_history_len:=10
@@ -554,7 +554,7 @@ class NodeCmdMotionInfer(Node):
         # Parameters (paths / IO)
         # -----------------------------
         self.declare_parameter("ckpt_dir", "")
-        self.declare_parameter("act_root", "")   # e.g. /home/eunseop/nrs_act
+        self.declare_parameter("act_root", "")   # e.g. /home/eunseop/nrs_imitation
         self.declare_parameter("policy_class", "ACT")  # ACT | DIFFUSION | FLOW
         self.declare_parameter("chunk_size", 200)
 
@@ -1102,7 +1102,7 @@ class NodeCmdMotionInfer(Node):
         return hist.astype(np.float32)
 
     # ------------------------------------------------------------
-    # Load policy (nrs_act/source/models/policy.py) + ckpt
+    # Load policy (nrs_imitation/source/models/policy.py) + ckpt
     # ------------------------------------------------------------
     def _load_policy_and_ckpt_from_act_root(self):
         act_source = os.path.join(self.act_root, "source")
@@ -1182,13 +1182,13 @@ class NodeCmdMotionInfer(Node):
 
         policy_class = str(self.policy_class).upper()
         if policy_class == "ACT":
-            self.get_logger().info("[INFO] Loading ACTPolicy from nrs_act/source/models/policy.py ...")
+            self.get_logger().info("[INFO] Loading ACTPolicy from nrs_imitation/source/models/policy.py ...")
             policy = ACTPolicy(args_override).to(self.device)
         elif policy_class == "DIFFUSION":
-            self.get_logger().info("[INFO] Loading DiffusionPolicy from nrs_act/source/models/policy.py ...")
+            self.get_logger().info("[INFO] Loading DiffusionPolicy from nrs_imitation/source/models/policy.py ...")
             policy = DiffusionPolicy(args_override).to(self.device)
         elif policy_class == "FLOW":
-            self.get_logger().info("[INFO] Loading FlowRGBPolicy from nrs_act/source/models/flow_core.py ...")
+            self.get_logger().info("[INFO] Loading FlowRGBPolicy from nrs_imitation/source/models/flow_core.py ...")
             if FlowRGBPolicy is None:
                 raise RuntimeError("FlowRGBPolicy import failed.")
             policy = FlowRGBPolicy(args_override).to(self.device)

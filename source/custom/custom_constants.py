@@ -11,7 +11,7 @@ import math
 #   /home/eunseop/nrs_lab2/datasets/ACT/<MMDD_HHMM>/act_data.hdf5
 # -------------------------------------------------------------------------
 # DATA_DIR = "/home/eunseop/nrs_lab2/datasets/ACT"
-DATA_DIR = "/home/eunseop/nrs_act/datasets/ACT"
+DATA_DIR = "/home/eunseop/nrs_imitation/datasets/ACT"
 
 
 def _find_latest_run_dir(base_dir: str) -> str:

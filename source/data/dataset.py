@@ -2,7 +2,7 @@
 """
 source/data/dataset.py
 
-ACT-style HDF5 dataset for nrs_act.
+ACT-style HDF5 dataset for nrs_imitation.
 
 Expected common HDF5 layout
 ---------------------------

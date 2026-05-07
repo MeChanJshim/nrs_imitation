@@ -263,7 +263,7 @@ public:
     // ----------------------------
     const char* home = std::getenv("HOME");
     if (!home) throw std::runtime_error("HOME env not set");
-    calib_yaml_path_ = std::string(home) + "/nrs_act/behavior_ws/src/vive_tracker_ros2/yaml/calibration_matrix.yaml";
+    calib_yaml_path_ = std::string(home) + "/nrs_imitation/behavior_ws/src/vive_tracker_ros2/yaml/calibration_matrix.yaml";
 
     // load existing constants (T_CE, T_SA_old)
     loadExistingYamlConstants();

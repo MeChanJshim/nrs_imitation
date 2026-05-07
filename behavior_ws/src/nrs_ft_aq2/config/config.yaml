@@ -39,7 +39,7 @@ Contact_Sensor_sign:
 # Force[1] = (H_Fy_sign-2)*Force[H_Fy];
 
 # Recording File Path
-Data1_path: "/home/eunseop/nrs_act/behavior_ws/src/nrs_ft_aq2/measured/data1.txt"
+Data1_path: "/home/eunseop/nrs_imitation/behavior_ws/src/nrs_ft_aq2/measured/data1.txt"
 
 # Record Switch
 Data1_switch: 0 # 1: Recording on, 0: Recording off

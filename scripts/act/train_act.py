@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACT training & evaluation script for nrs_act.
+ACT training & evaluation script for nrs_imitation.
 
 This version supports normalization mode selection:
 
@@ -74,7 +74,7 @@ def _count_episodes(dataset_dir: str) -> int:
 
 
 def find_latest_episode_dir(
-    root_dir: str = "/home/eunseop/nrs_act/datasets/ACT",
+    root_dir: str = "/home/eunseop/nrs_imitation/datasets/ACT",
     subdir_name: str = "episodes_ft",
 ) -> str:
     root = Path(root_dir).expanduser()
@@ -122,7 +122,7 @@ def resolve_dataset_dir(dataset_dir: Optional[str], task_name: str, cam_preproce
         print(f"[WARN] TASK_CONFIGS dataset_dir invalid or empty, fallback to latest: {resolved}")
 
     subdir_name = "episodes_ft_camproc" if cam_preprocess == "stabilize_crop" else "episodes_ft"
-    latest = find_latest_episode_dir("/home/eunseop/nrs_act/datasets/ACT", subdir_name=subdir_name)
+    latest = find_latest_episode_dir("/home/eunseop/nrs_imitation/datasets/ACT", subdir_name=subdir_name)
     print(f"[AUTO] dataset_dir not provided -> using latest {subdir_name}: {latest}")
     return latest
 
@@ -341,7 +341,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
     p.add_argument("--eval", action="store_true")
-    p.add_argument("--ckpt_dir", type=str, default="/home/eunseop/nrs_act/checkpoints/act/ur10e_swing")
+    p.add_argument("--ckpt_dir", type=str, default="/home/eunseop/nrs_imitation/checkpoints/act/ur10e_swing")
     p.add_argument("--policy_class", type=str, default="ACT", choices=["ACT", "CNNMLP"])
     p.add_argument("--task_name", type=str, default="ur10e_swing")
 

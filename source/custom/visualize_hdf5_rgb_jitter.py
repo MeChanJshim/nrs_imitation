@@ -6,7 +6,7 @@ visualize_hdf5_rgb_jitter.py
 Analyze and visualize single-camera RGB hand-shake / jitter in ACT-format HDF5 episodes.
 
 Default target:
-    /home/eunseop/nrs_act/datasets/ACT/<latest_timestamp>/episodes_ft/*.hdf5
+    /home/eunseop/nrs_imitation/datasets/ACT/<latest_timestamp>/episodes_ft/*.hdf5
 
 Expected HDF5 image key candidates:
     /observations/images/cam0
@@ -15,7 +15,7 @@ Expected HDF5 image key candidates:
     /cam0
 
 Outputs:
-    /home/eunseop/nrs_act/analysis_logs/camera_jitter/<timestamp_dataset>/
+    /home/eunseop/nrs_imitation/analysis_logs/camera_jitter/<timestamp_dataset>/
         jitter_summary.csv
         jitter_summary_by_index.png
         jitter_summary_ranking.png
@@ -564,13 +564,13 @@ def save_report(results: Sequence[EpisodeJitterResult], out_path: Path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--act_root", type=str, default="/home/eunseop/nrs_act/datasets/ACT")
+    parser.add_argument("--act_root", type=str, default="/home/eunseop/nrs_imitation/datasets/ACT")
     parser.add_argument("--dataset_dir", type=str, default=None,
                         help="Direct path to episodes_ft. If omitted, latest ACT/<timestamp>/episodes_ft is used.")
     parser.add_argument("--subdir_name", type=str, default="episodes_ft",
                         help="Usually episodes_ft or episodes_ft_camproc.")
     parser.add_argument("--camera_name", type=str, default="cam0")
-    parser.add_argument("--output_root", type=str, default="/home/eunseop/nrs_act/analysis_logs/camera_jitter")
+    parser.add_argument("--output_root", type=str, default="/home/eunseop/nrs_imitation/analysis_logs/camera_jitter")
     parser.add_argument("--max_episodes", type=int, default=0,
                         help="0 means all episodes.")
     parser.add_argument("--max_frames", type=int, default=0,

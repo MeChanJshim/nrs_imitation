@@ -316,7 +316,7 @@ class ViveTracker(Node):
     # yaml calib
     # ------------------------------------------------------------------
     def _init_yaml_calib(self):
-        src_yaml = os.path.join(os.path.expanduser("~/nrs_act/behavior_ws/src/vive_tracker_ros2/yaml"),
+        src_yaml = os.path.join(os.path.expanduser("~/nrs_imitation/behavior_ws/src/vive_tracker_ros2/yaml"),
                                 "calibration_matrix.yaml")
         share_dir = ament_index_python.packages.get_package_share_directory("vive_tracker_ros2")
         install_yaml = os.path.join(share_dir, "yaml", "calibration_matrix.yaml")

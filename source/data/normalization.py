@@ -2,7 +2,7 @@
 """
 source/data/normalization.py
 
-Normalization utilities for nrs_act.
+Normalization utilities for nrs_imitation.
 
 Supported modes
 ---------------

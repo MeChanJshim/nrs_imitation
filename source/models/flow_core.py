@@ -3,7 +3,7 @@
 """
 flow_core.py
 
-RGB-conditioned Flow Matching policy core for nrs_act.
+RGB-conditioned Flow Matching policy core for nrs_imitation.
 
 References
 ----------
@@ -111,7 +111,7 @@ Euler integration:
 
 Implementation note
 -------------------
-This file is a custom adaptation for the nrs_act HDF5 / ACT pipeline.
+This file is a custom adaptation for the nrs_imitation HDF5 / ACT pipeline.
 It is not a direct copy of any official Flow Matching, Rectified Flow,
 PointFlowMatch, FlowPolicy, or Flow-with-the-Force-Field repository.
 

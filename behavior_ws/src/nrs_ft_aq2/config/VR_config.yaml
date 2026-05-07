@@ -23,7 +23,7 @@ ft_aq:
     Contact_Sensor_sign:  [3, 3, 3]
 
     # Recording
-    Data1_path: "/home/eunseop/nrs_act/behavior_ws/src/nrs_ft_aq2/measured/data1.txt"
+    Data1_path: "/home/eunseop/nrs_imitation/behavior_ws/src/nrs_ft_aq2/measured/data1.txt"
     Data1_switch: 0
 
     # Print

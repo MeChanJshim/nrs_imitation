@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ROOT_DEFAULT = "/home/eunseop/nrs_lab2/datasets/ACT"
-ROOT_DEFAULT = "/home/eunseop/nrs_act/datasets/ACT"
+ROOT_DEFAULT = "/home/eunseop/nrs_imitation/datasets/ACT"
 MERGED_SUBDIR = "merged_hdf5"
 
 # ---------------------------

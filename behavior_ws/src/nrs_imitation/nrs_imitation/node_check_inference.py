@@ -23,7 +23,7 @@ Why previous crash happened:
 Usage:
 ros2 run nrs_imitation node_check_inference --ros-args \
   -p ckpt_dir:=/home/eunseop/nrs_lab2/checkpoints/ur10e_swing/20260208_1536 \
-  -p act_root:=/home/eunseop/nrs_lab2/nrs_act \
+  -p act_root:=/home/eunseop/nrs_lab2/nrs_imitation \
   -p chunk_size:=100 \
   -p image_qos:=reliable \
   -p dump_full:=False \

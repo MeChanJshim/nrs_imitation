@@ -50,7 +50,7 @@ except Exception:
     cv2 = None
 
 
-ROOT_DEFAULT = "/home/eunseop/nrs_act/datasets/ACT"
+ROOT_DEFAULT = "/home/eunseop/nrs_imitation/datasets/ACT"
 MERGED_SUBDIR = "merged_hdf5"
 EPISODES_SUBDIR_RAW = "episodes_ft"
 EPISODES_SUBDIR_CAMPROC = "episodes_ft_camproc"

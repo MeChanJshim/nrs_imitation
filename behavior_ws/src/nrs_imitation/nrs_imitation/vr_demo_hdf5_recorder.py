@@ -37,7 +37,7 @@ Important:
       * Ctrl+C / explicit stop is requested
 
 Output merged HDF5 layout:
-  /home/eunseop/nrs_act/datasets/ACT/YYYYMMDD_HHMM/merged_hdf5/
+  /home/eunseop/nrs_imitation/datasets/ACT/YYYYMMDD_HHMM/merged_hdf5/
     vr_demo_merged_YYYYMMDD_HHMM.hdf5
 
   episodes/
@@ -530,7 +530,7 @@ class VRDemoHDF5Recorder(Node):
         # -------------------------
         # Save parameters
         # -------------------------
-        self.declare_parameter("act_root_dir", "/home/eunseop/nrs_act/datasets/ACT")
+        self.declare_parameter("act_root_dir", "/home/eunseop/nrs_imitation/datasets/ACT")
         self.declare_parameter("merged_subdir", "merged_hdf5")
         self.declare_parameter("file_prefix", "vr_demo_merged")
         self.declare_parameter("overwrite_file", False)
