@@ -13,7 +13,7 @@ ft_aq:
 
     # Sensor Sampling (s)
     Sensor_sampling: 0.002    # 500 Hz
-    Publish_sampling: 0.02     # publish 주기 = 500Hz  (새로 추가)
+    Publish_sampling: 0.002     # publish 주기 = 500Hz  (새로 추가)
   
     # Sensor Coordinate
     Handle_Sensor_Order: [2, 0, 1]

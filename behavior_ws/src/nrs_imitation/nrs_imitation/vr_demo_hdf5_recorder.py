@@ -69,6 +69,11 @@ from typing import Optional, List, Tuple, Set
 import numpy as np
 import h5py
 
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, String
@@ -167,6 +172,211 @@ def stack_images_repeat_last(frames: List[Optional[np.ndarray]], logger=None) ->
 
     return out
 
+
+
+
+# ============================================================
+# Camera stabilization / jitter diagnostics
+# ============================================================
+def moving_average_1d(x: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0 or x.size == 0:
+        return x.astype(np.float32).copy()
+    kernel = np.ones((2 * radius + 1,), dtype=np.float32) / float(2 * radius + 1)
+    x_pad = np.pad(x.astype(np.float32), (radius, radius), mode="edge")
+    y = np.convolve(x_pad, kernel, mode="same")
+    return y[radius:-radius].astype(np.float32)
+
+
+def estimate_pair_transform(prev_gray: np.ndarray, curr_gray: np.ndarray) -> Tuple[float, float, float]:
+    """Estimate global dx, dy, dtheta from prev -> curr."""
+    if cv2 is None:
+        return 0.0, 0.0, 0.0
+
+    prev_pts = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners=200,
+        qualityLevel=0.01,
+        minDistance=20,
+        blockSize=3,
+    )
+    if prev_pts is None or len(prev_pts) < 8:
+        return 0.0, 0.0, 0.0
+
+    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None)
+    if curr_pts is None or status is None:
+        return 0.0, 0.0, 0.0
+
+    good_prev = prev_pts[status.flatten() == 1]
+    good_curr = curr_pts[status.flatten() == 1]
+    if len(good_prev) < 8 or len(good_curr) < 8:
+        return 0.0, 0.0, 0.0
+
+    m, _ = cv2.estimateAffinePartial2D(good_prev, good_curr, method=cv2.RANSAC)
+    if m is None:
+        return 0.0, 0.0, 0.0
+
+    dx = float(m[0, 2])
+    dy = float(m[1, 2])
+    da = float(np.arctan2(m[1, 0], m[0, 0]))
+    return dx, dy, da
+
+
+def compute_jitter_metrics(images: np.ndarray, smoothing_radius: int = 15) -> dict:
+    """
+    Estimate high-frequency global camera jitter in pixel units.
+
+    Jitter is defined as frame-to-frame global translation residual after
+    removing low-frequency motion by moving-average smoothing.
+    """
+    imgs = np.asarray(images)
+    T = int(imgs.shape[0]) if imgs.ndim >= 4 else 0
+    if cv2 is None or T <= 2:
+        return {
+            "frames": T,
+            "shape": tuple(imgs.shape[1:]) if imgs.ndim >= 4 else (),
+            "rms_px": 0.0,
+            "p95_px": 0.0,
+            "max_px": 0.0,
+            "mean_motion_px": 0.0,
+        }
+
+    transforms = np.zeros((T - 1, 3), dtype=np.float32)
+    prev_gray = cv2.cvtColor(imgs[0], cv2.COLOR_RGB2GRAY)
+    for i in range(T - 1):
+        curr_gray = cv2.cvtColor(imgs[i + 1], cv2.COLOR_RGB2GRAY)
+        transforms[i] = np.asarray(estimate_pair_transform(prev_gray, curr_gray), dtype=np.float32)
+        prev_gray = curr_gray
+
+    trans_xy = transforms[:, :2].astype(np.float32)
+    smooth_xy = np.zeros_like(trans_xy)
+    for j in range(2):
+        smooth_xy[:, j] = moving_average_1d(trans_xy[:, j], smoothing_radius)
+    residual_xy = trans_xy - smooth_xy
+    jitter = np.linalg.norm(residual_xy, axis=1)
+    motion = np.linalg.norm(trans_xy, axis=1)
+
+    return {
+        "frames": T,
+        "shape": tuple(imgs.shape[1:]),
+        "rms_px": float(np.sqrt(np.mean(jitter ** 2))) if jitter.size else 0.0,
+        "p95_px": float(np.percentile(jitter, 95)) if jitter.size else 0.0,
+        "max_px": float(np.max(jitter)) if jitter.size else 0.0,
+        "mean_motion_px": float(np.mean(motion)) if motion.size else 0.0,
+    }
+
+
+def stabilize_image_sequence(images: np.ndarray,
+                             smoothing_radius: int = 15,
+                             border_mode: str = "reflect") -> np.ndarray:
+    """Offline whole-episode video stabilization. images: (T,H,W,3) RGB uint8."""
+    if cv2 is None:
+        return np.asarray(images, dtype=np.uint8).copy()
+
+    imgs = np.asarray(images, dtype=np.uint8)
+    T = int(imgs.shape[0])
+    if T <= 1:
+        return imgs.copy()
+
+    prev_gray = cv2.cvtColor(imgs[0], cv2.COLOR_RGB2GRAY)
+    transforms = np.zeros((T - 1, 3), dtype=np.float32)
+
+    for i in range(T - 1):
+        curr_gray = cv2.cvtColor(imgs[i + 1], cv2.COLOR_RGB2GRAY)
+        transforms[i] = np.asarray(estimate_pair_transform(prev_gray, curr_gray), dtype=np.float32)
+        prev_gray = curr_gray
+
+    trajectory = np.cumsum(transforms, axis=0)
+    smoothed = np.zeros_like(trajectory)
+    for j in range(3):
+        smoothed[:, j] = moving_average_1d(trajectory[:, j], smoothing_radius)
+
+    diff = smoothed - trajectory
+    transforms_smooth = transforms.copy()
+    transforms_smooth[:, 0] += diff[:, 0]
+    transforms_smooth[:, 1] += diff[:, 1]
+    transforms_smooth[:, 2] += diff[:, 2]
+
+    H, W = imgs.shape[1], imgs.shape[2]
+    out = np.empty_like(imgs)
+    out[0] = imgs[0]
+
+    if str(border_mode).lower() == "constant":
+        border_flag = cv2.BORDER_CONSTANT
+    elif str(border_mode).lower() == "replicate":
+        border_flag = cv2.BORDER_REPLICATE
+    else:
+        border_flag = cv2.BORDER_REFLECT
+
+    for i in range(1, T):
+        dx, dy, da = [float(x) for x in transforms_smooth[i - 1]]
+        c = float(np.cos(da))
+        s = float(np.sin(da))
+        m = np.array([[c, -s, dx], [s, c, dy]], dtype=np.float32)
+        out[i] = cv2.warpAffine(
+            imgs[i],
+            m,
+            (W, H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=border_flag,
+        )
+    return out.astype(np.uint8)
+
+
+def center_crop_images(images: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
+    imgs = np.asarray(images, dtype=np.uint8)
+    H, W = imgs.shape[1], imgs.shape[2]
+    ch = int(min(max(1, crop_h), H))
+    cw = int(min(max(1, crop_w), W))
+    y0 = max(0, (H - ch) // 2)
+    x0 = max(0, (W - cw) // 2)
+    return imgs[:, y0:y0 + ch, x0:x0 + cw, :]
+
+
+def resize_images(images: np.ndarray, resize_hw: int) -> np.ndarray:
+    imgs = np.asarray(images, dtype=np.uint8)
+    if resize_hw <= 0:
+        return imgs.copy()
+    if cv2 is None:
+        return imgs.copy()
+    out = []
+    for im in imgs:
+        out.append(cv2.resize(im, (resize_hw, resize_hw), interpolation=cv2.INTER_LINEAR))
+    return np.stack(out, axis=0).astype(np.uint8)
+
+
+def preprocess_image_sequence(images: np.ndarray,
+                              mode: str = "stabilize_crop",
+                              crop_h: int = 384,
+                              crop_w: int = 384,
+                              resize_hw: int = 256,
+                              smoothing_radius: int = 15,
+                              border_mode: str = "reflect") -> np.ndarray:
+    mode = str(mode).strip().lower()
+    imgs = np.asarray(images, dtype=np.uint8)
+    if mode in ("off", "none", "raw"):
+        return imgs.copy()
+    if mode not in ("stabilize", "stabilize_crop"):
+        raise ValueError(f"Unsupported camera_preprocess_mode: {mode}")
+
+    imgs = stabilize_image_sequence(
+        imgs,
+        smoothing_radius=int(smoothing_radius),
+        border_mode=str(border_mode),
+    )
+    if mode == "stabilize_crop":
+        imgs = center_crop_images(imgs, crop_h=int(crop_h), crop_w=int(crop_w))
+        imgs = resize_images(imgs, resize_hw=int(resize_hw))
+    return imgs.astype(np.uint8)
+
+
+def format_jitter_metrics(m: dict) -> str:
+    return (
+        f"frames={m.get('frames', 0)}, shape={m.get('shape', ())}, "
+        f"RMS={m.get('rms_px', 0.0):.4f}px, "
+        f"P95={m.get('p95_px', 0.0):.4f}px, "
+        f"max={m.get('max_px', 0.0):.4f}px, "
+        f"mean_motion={m.get('mean_motion_px', 0.0):.4f}px"
+    )
 
 # ============================================================
 # Filtering utilities
@@ -388,6 +598,19 @@ class VRDemoHDF5Recorder(Node):
         self.declare_parameter("image_gzip_level", 4)
 
         # -------------------------
+        # Camera preprocessing / stabilization
+        # Default ON: save stabilized/cropped RGB to reduce hand-shake noise.
+        # Use camera_preprocess_mode:=off to save raw RGB.
+        # -------------------------
+        self.declare_parameter("camera_preprocess_mode", "stabilize_crop")  # off | stabilize | stabilize_crop
+        self.declare_parameter("cam_crop_h", 384)
+        self.declare_parameter("cam_crop_w", 384)
+        self.declare_parameter("cam_resize_hw", 256)
+        self.declare_parameter("cam_stab_smoothing_radius", 15)
+        self.declare_parameter("cam_stab_border_mode", "reflect")
+        self.declare_parameter("camera_jitter_report_enable", True)
+
+        # -------------------------
         # Load parameters
         # -------------------------
         self.act_root_dir = str(self.get_parameter("act_root_dir").value)
@@ -450,6 +673,18 @@ class VRDemoHDF5Recorder(Node):
         self.image_dataset_name = str(self.get_parameter("image_dataset_name").value)
         self.image_compression = str(self.get_parameter("image_compression").value).lower()
         self.image_gzip_level = int(self.get_parameter("image_gzip_level").value)
+
+        self.camera_preprocess_mode = str(self.get_parameter("camera_preprocess_mode").value).strip().lower()
+        self.cam_crop_h = int(self.get_parameter("cam_crop_h").value)
+        self.cam_crop_w = int(self.get_parameter("cam_crop_w").value)
+        self.cam_resize_hw = int(self.get_parameter("cam_resize_hw").value)
+        self.cam_stab_smoothing_radius = int(self.get_parameter("cam_stab_smoothing_radius").value)
+        self.cam_stab_border_mode = str(self.get_parameter("cam_stab_border_mode").value).strip().lower()
+        self.camera_jitter_report_enable = bool(self.get_parameter("camera_jitter_report_enable").value)
+        if self.camera_preprocess_mode not in ("off", "none", "raw", "stabilize", "stabilize_crop"):
+            raise RuntimeError(
+                f"camera_preprocess_mode must be off/stabilize/stabilize_crop, got: {self.camera_preprocess_mode}"
+            )
 
         # -------------------------
         # HDF5 lazy-open state
@@ -551,6 +786,12 @@ class VRDemoHDF5Recorder(Node):
         )
         self.get_logger().info(
             f"  image save    : compression={self.image_compression}, gzip_level={self.image_gzip_level}"
+        )
+        self.get_logger().info(
+            f"  cam preprocess: mode={self.camera_preprocess_mode}, "
+            f"crop=({self.cam_crop_h},{self.cam_crop_w}), resize_hw={self.cam_resize_hw}, "
+            f"stab_radius={self.cam_stab_smoothing_radius}, border={self.cam_stab_border_mode}, "
+            f"jitter_report={self.camera_jitter_report_enable}"
         )
         self.get_logger().info(
             f"  target eps    : {self.num_episodes} (informational only; no auto-stop)"
@@ -730,6 +971,12 @@ class VRDemoHDF5Recorder(Node):
             g.attrs["pose_ema_alpha"] = float(self.pose_ema_alpha)
             g.attrs["image_dataset_name"] = np.string_(self.image_dataset_name)
             g.attrs["image_shape"] = np.array(images.shape[1:], dtype=np.int64)
+            g.attrs["camera_preprocess_mode"] = np.string_(str(self.camera_preprocess_mode))
+            g.attrs["cam_crop_h"] = int(self.cam_crop_h)
+            g.attrs["cam_crop_w"] = int(self.cam_crop_w)
+            g.attrs["cam_resize_hw"] = int(self.cam_resize_hw)
+            g.attrs["cam_stab_smoothing_radius"] = int(self.cam_stab_smoothing_radius)
+            g.attrs["cam_stab_border_mode"] = np.string_(str(self.cam_stab_border_mode))
 
             g.create_dataset("position", data=position.astype(np.float32), dtype="float32")
             g.create_dataset("ft", data=ft.astype(np.float32), dtype="float32")
@@ -1194,6 +1441,36 @@ class VRDemoHDF5Recorder(Node):
             if images is None:
                 self.get_logger().warn(f"Episode dropped: no valid image frames. N={N}, reason={reason}")
                 return
+
+            raw_jitter = compute_jitter_metrics(
+                images,
+                smoothing_radius=max(1, int(self.cam_stab_smoothing_radius)),
+            )
+            images_proc = preprocess_image_sequence(
+                images,
+                mode=self.camera_preprocess_mode,
+                crop_h=self.cam_crop_h,
+                crop_w=self.cam_crop_w,
+                resize_hw=self.cam_resize_hw,
+                smoothing_radius=max(1, int(self.cam_stab_smoothing_radius)),
+                border_mode=self.cam_stab_border_mode,
+            )
+            proc_jitter = compute_jitter_metrics(
+                images_proc,
+                smoothing_radius=max(1, int(self.cam_stab_smoothing_radius)),
+            )
+            if self.camera_jitter_report_enable:
+                before = float(raw_jitter.get("rms_px", 0.0))
+                after = float(proc_jitter.get("rms_px", 0.0))
+                reduction = 0.0 if before <= 1e-9 else 100.0 * (before - after) / before
+                self.get_logger().info(
+                    f"[CAM-JITTER] before: {format_jitter_metrics(raw_jitter)}"
+                )
+                self.get_logger().info(
+                    f"[CAM-JITTER] after : {format_jitter_metrics(proc_jitter)} | "
+                    f"RMS_reduction={reduction:.2f}% | mode={self.camera_preprocess_mode}"
+                )
+            images = images_proc
 
             if self.pose_ema_enable:
                 P_out = ema_nd(P, alpha=self.pose_ema_alpha)

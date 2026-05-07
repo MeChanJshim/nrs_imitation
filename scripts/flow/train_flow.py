@@ -546,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_dir", type=str, default="/home/eunseop/nrs_act/checkpoints/flow/ur10e_swing")
 
     parser.add_argument("--dataset_dir", type=str, default=None)
-    parser.add_argument("--cam_preprocess", type=str, default="off", choices=["off", "stabilize_crop"])
+    parser.add_argument("--cam_preprocess", type=str, default="stabilize_crop", choices=["off", "stabilize_crop"])
     parser.add_argument("--norm_mode", type=str, default="minmax_m11", choices=["minmax_01", "minmax_m11"])
     parser.add_argument("--num_episodes", type=int, default=0)
     parser.add_argument("--camera_names", nargs="+", default=["cam0"])

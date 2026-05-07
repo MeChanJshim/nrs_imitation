@@ -45,6 +45,11 @@ from enum import Enum
 import numpy as np
 import torch
 
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -146,6 +151,66 @@ def _to_tensor_image_stack(
     img_t = torch.from_numpy(img).unsqueeze(0).to(device=device, dtype=torch.float32)  # (1,1,3,H,W)
     return img_t
 
+
+
+
+# ============================================================
+# Helpers (online camera stabilization / jitter diagnostics)
+# ============================================================
+def _estimate_pair_transform(prev_gray: np.ndarray, curr_gray: np.ndarray):
+    if cv2 is None:
+        return 0.0, 0.0, 0.0
+
+    prev_pts = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners=200,
+        qualityLevel=0.01,
+        minDistance=20,
+        blockSize=3,
+    )
+    if prev_pts is None or len(prev_pts) < 8:
+        return 0.0, 0.0, 0.0
+
+    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None)
+    if curr_pts is None or status is None:
+        return 0.0, 0.0, 0.0
+
+    good_prev = prev_pts[status.flatten() == 1]
+    good_curr = curr_pts[status.flatten() == 1]
+    if len(good_prev) < 8 or len(good_curr) < 8:
+        return 0.0, 0.0, 0.0
+
+    m, _ = cv2.estimateAffinePartial2D(good_prev, good_curr, method=cv2.RANSAC)
+    if m is None:
+        return 0.0, 0.0, 0.0
+
+    dx = float(m[0, 2])
+    dy = float(m[1, 2])
+    da = float(np.arctan2(m[1, 0], m[0, 0]))
+    return dx, dy, da
+
+
+def _warp_rgb_affine(rgb: np.ndarray, dx: float, dy: float, da: float, border_mode: str = "reflect") -> np.ndarray:
+    if cv2 is None:
+        return rgb.copy()
+    H, W = int(rgb.shape[0]), int(rgb.shape[1])
+    c = float(np.cos(da))
+    s = float(np.sin(da))
+    m = np.array([[c, -s, dx], [s, c, dy]], dtype=np.float32)
+    b = str(border_mode).strip().lower()
+    if b == "constant":
+        border_flag = cv2.BORDER_CONSTANT
+    elif b == "replicate":
+        border_flag = cv2.BORDER_REPLICATE
+    else:
+        border_flag = cv2.BORDER_REFLECT
+    return cv2.warpAffine(
+        rgb,
+        m,
+        (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=border_flag,
+    )
 
 # ============================================================
 # Helpers (Stats)
@@ -455,7 +520,7 @@ class NodeCmdMotionInfer(Node):
         # -----------------------------
         self.declare_parameter("ckpt_dir", "")
         self.declare_parameter("act_root", "")   # e.g. /home/eunseop/nrs_act
-        self.declare_parameter("policy_class", "ACT")  # ACT | DIFFUSION
+        self.declare_parameter("policy_class", "ACT")  # ACT | DIFFUSION | FLOW
         self.declare_parameter("chunk_size", 200)
 
         self.declare_parameter("pose_topic", "/ur10skku/currentP")
@@ -464,6 +529,15 @@ class NodeCmdMotionInfer(Node):
         self.declare_parameter("cmd_topic", "/ur10skku/cmdMotion")
 
         self.declare_parameter("image_qos", "best_effort")
+
+        # Camera preprocessing for online inference.
+        # Default ON: real-time stabilization of incoming RGB before policy observation.
+        self.declare_parameter("camera_preprocess_mode", "stabilize")  # off | stabilize
+        self.declare_parameter("camera_stabilize_alpha", 0.92)          # cumulative trajectory EMA
+        self.declare_parameter("camera_stabilize_border_mode", "reflect")
+        self.declare_parameter("camera_jitter_report_enable", True)
+        self.declare_parameter("camera_jitter_log_every_n", 100)
+
         self.declare_parameter("control_hz", 30.0)
         self.declare_parameter("infer_hz", 7.5)
 
@@ -558,6 +632,19 @@ class NodeCmdMotionInfer(Node):
         self.declare_parameter("diffusion_beta_end", 2e-2)
         self.declare_parameter("diffusion_loss_type", "mse")
 
+        # FLOW policy config
+        self.declare_parameter("flow_infer_steps", 10)
+        self.declare_parameter("flow_train_eps", 1e-4)
+        self.declare_parameter("flow_loss_type", "mse")
+        self.declare_parameter("flow_obs_hidden_dim", 256)
+        self.declare_parameter("flow_image_feature_dim", 512)
+        self.declare_parameter("flow_global_cond_dim", 256)
+        self.declare_parameter("flow_time_embed_dim", 256)
+        self.declare_parameter("flow_down_dims", "256,512,1024")
+        self.declare_parameter("flow_kernel_size", 5)
+        self.declare_parameter("flow_n_groups", 8)
+        self.declare_parameter("flow_cond_predict_scale", False)
+
         # stall + recover
         self.declare_parameter("stall_sec", 1.2)
         self.declare_parameter("stall_min_after_start_sec", 1.0)
@@ -618,6 +705,14 @@ class NodeCmdMotionInfer(Node):
         self.cmd_topic = str(self.get_parameter("cmd_topic").value)
 
         self.image_qos_str = str(self.get_parameter("image_qos").value)
+        self.camera_preprocess_mode = str(self.get_parameter("camera_preprocess_mode").value).strip().lower()
+        self.camera_stabilize_alpha = float(self.get_parameter("camera_stabilize_alpha").value)
+        self.camera_stabilize_border_mode = str(self.get_parameter("camera_stabilize_border_mode").value).strip().lower()
+        self.camera_jitter_report_enable = bool(self.get_parameter("camera_jitter_report_enable").value)
+        self.camera_jitter_log_every_n = max(1, int(self.get_parameter("camera_jitter_log_every_n").value))
+        if self.camera_preprocess_mode not in ("off", "none", "raw", "stabilize"):
+            raise RuntimeError(f"camera_preprocess_mode must be off or stabilize, got: {self.camera_preprocess_mode}")
+
         self.control_hz = float(self.get_parameter("control_hz").value)
         self.infer_hz = float(self.get_parameter("infer_hz").value)
 
@@ -724,17 +819,42 @@ class NodeCmdMotionInfer(Node):
         self.recover_timeout_min_margin_sec = float(self.get_parameter("recover_timeout_min_margin_sec").value)
         self.recover_timeout_scale = float(self.get_parameter("recover_timeout_scale").value)
 
+        # diffusion policy config
+        self.diffusion_train_steps = int(self.get_parameter("diffusion_train_steps").value)
+        self.diffusion_infer_steps = int(self.get_parameter("diffusion_infer_steps").value)
+        self.diffusion_beta_start = float(self.get_parameter("diffusion_beta_start").value)
+        self.diffusion_beta_end = float(self.get_parameter("diffusion_beta_end").value)
+        self.diffusion_loss_type = str(self.get_parameter("diffusion_loss_type").value)
+
+        # FLOW policy config
+        self.flow_infer_steps = int(self.get_parameter("flow_infer_steps").value)
+        self.flow_train_eps = float(self.get_parameter("flow_train_eps").value)
+        self.flow_loss_type = str(self.get_parameter("flow_loss_type").value)
+        self.flow_obs_hidden_dim = int(self.get_parameter("flow_obs_hidden_dim").value)
+        self.flow_image_feature_dim = int(self.get_parameter("flow_image_feature_dim").value)
+        self.flow_global_cond_dim = int(self.get_parameter("flow_global_cond_dim").value)
+        self.flow_time_embed_dim = int(self.get_parameter("flow_time_embed_dim").value)
+        self.flow_down_dims = str(self.get_parameter("flow_down_dims").value)
+        self.flow_kernel_size = int(self.get_parameter("flow_kernel_size").value)
+        self.flow_n_groups = int(self.get_parameter("flow_n_groups").value)
+        self.flow_cond_predict_scale = bool(self.get_parameter("flow_cond_predict_scale").value)
+
         # device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"[INFO] Using device: {self.device}")
+        self.get_logger().info(
+            f"[CAM] preprocess_mode={self.camera_preprocess_mode}, "
+            f"alpha={self.camera_stabilize_alpha:.3f}, border={self.camera_stabilize_border_mode}, "
+            f"jitter_report={self.camera_jitter_report_enable}, log_every={self.camera_jitter_log_every_n}"
+        )
 
         # validate paths
         if not self.ckpt_dir or not os.path.isdir(self.ckpt_dir):
             raise RuntimeError(f"ckpt_dir invalid: {self.ckpt_dir}")
         if not self.act_root or not os.path.isdir(self.act_root):
             raise RuntimeError(f"act_root invalid: {self.act_root}")
-        if self.policy_class not in ("ACT", "DIFFUSION"):
-            raise RuntimeError(f"policy_class must be ACT or DIFFUSION, got: {self.policy_class}")
+        if self.policy_class not in ("ACT", "DIFFUSION", "FLOW"):
+            raise RuntimeError(f"policy_class must be ACT, DIFFUSION, or FLOW, got: {self.policy_class}")
 
         # stats
         self.stats = _load_dataset_stats(self.ckpt_dir)
@@ -764,6 +884,15 @@ class NodeCmdMotionInfer(Node):
         self._pose6: Optional[np.ndarray] = None
         self._force: Optional[np.ndarray] = None
         self._img_cam0: Optional[np.ndarray] = None
+
+        # Online camera stabilization state. All jitter values are pixel units.
+        self._cam_prev_raw_gray: Optional[np.ndarray] = None
+        self._cam_prev_proc_gray: Optional[np.ndarray] = None
+        self._cam_cum = np.zeros(3, dtype=np.float32)
+        self._cam_smooth_cum = np.zeros(3, dtype=np.float32)
+        self._cam_frame_count = 0
+        self._cam_raw_jitter_ema = 0.0
+        self._cam_proc_jitter_ema = 0.0
 
         self._force_hist: Deque[np.ndarray] = deque(maxlen=max(1, self.force_history_len))
 
@@ -917,8 +1046,17 @@ class NodeCmdMotionInfer(Node):
             from models.policy import ACTPolicy, DiffusionPolicy
         except Exception as e:
             raise RuntimeError(
-                f"Failed to import policy classes from {act_source}/models/policy.py : {e}"
+                f"Failed to import ACT/Diffusion policy classes from {act_source}/models/policy.py : {e}"
             )
+
+        try:
+            from models.flow_core import FlowRGBPolicy
+        except Exception as e:
+            FlowRGBPolicy = None
+            if str(self.policy_class).upper() == "FLOW":
+                raise RuntimeError(
+                    f"Failed to import FlowRGBPolicy from {act_source}/models/flow_core.py : {e}"
+                )
 
         args_override = {
             "kl_weight": float(self.get_parameter("kl_weight").value),
@@ -950,12 +1088,27 @@ class NodeCmdMotionInfer(Node):
             "force_encoder_dropout": self.force_encoder_dropout,
             "observation_encoder_activation": self.observation_encoder_activation,
 
-            # diffusion config (ignored by ACTPolicy)
+            # diffusion config (ignored by ACTPolicy/FLOW)
             "diffusion_train_steps": self.diffusion_train_steps,
             "diffusion_infer_steps": self.diffusion_infer_steps,
             "diffusion_beta_start": self.diffusion_beta_start,
             "diffusion_beta_end": self.diffusion_beta_end,
             "diffusion_loss_type": self.diffusion_loss_type,
+
+            # FLOW config
+            "use_force_history": self.use_force_history,
+            "force_history_len": self.force_history_len,
+            "flow_infer_steps": self.flow_infer_steps,
+            "flow_train_eps": self.flow_train_eps,
+            "flow_loss_type": self.flow_loss_type,
+            "flow_obs_hidden_dim": self.flow_obs_hidden_dim,
+            "flow_image_feature_dim": self.flow_image_feature_dim,
+            "flow_global_cond_dim": self.flow_global_cond_dim,
+            "flow_time_embed_dim": self.flow_time_embed_dim,
+            "flow_down_dims": self.flow_down_dims,
+            "flow_kernel_size": self.flow_kernel_size,
+            "flow_n_groups": self.flow_n_groups,
+            "flow_cond_predict_scale": self.flow_cond_predict_scale,
         }
 
         policy_class = str(self.policy_class).upper()
@@ -965,6 +1118,11 @@ class NodeCmdMotionInfer(Node):
         elif policy_class == "DIFFUSION":
             self.get_logger().info("[INFO] Loading DiffusionPolicy from nrs_act/source/models/policy.py ...")
             policy = DiffusionPolicy(args_override).to(self.device)
+        elif policy_class == "FLOW":
+            self.get_logger().info("[INFO] Loading FlowRGBPolicy from nrs_act/source/models/flow_core.py ...")
+            if FlowRGBPolicy is None:
+                raise RuntimeError("FlowRGBPolicy import failed.")
+            policy = FlowRGBPolicy(args_override).to(self.device)
         else:
             raise RuntimeError(f"Unsupported policy_class: {self.policy_class}")
 
@@ -1022,13 +1180,83 @@ class NodeCmdMotionInfer(Node):
             if arr.size >= 3:
                 self._force_hist.append(self._extract_force3(arr))
 
+    def _preprocess_live_image(self, rgb: np.ndarray) -> np.ndarray:
+        """
+        Causal online stabilization for inference-time camera observation.
+
+        This does not crop or resize. Resizing remains handled by _to_tensor_image_stack().
+        It estimates frame-to-frame global translation/rotation, smooths the cumulative
+        camera trajectory by EMA, and applies the correction to the current RGB frame.
+        """
+        if self.camera_preprocess_mode in ("off", "none", "raw") or cv2 is None:
+            return rgb.copy()
+
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+        if self._cam_prev_raw_gray is None:
+            self._cam_prev_raw_gray = gray
+            self._cam_prev_proc_gray = gray
+            return rgb.copy()
+
+        dx, dy, da = _estimate_pair_transform(self._cam_prev_raw_gray, gray)
+        raw_norm = float(math.sqrt(dx * dx + dy * dy))
+
+        delta = np.array([dx, dy, da], dtype=np.float32)
+        self._cam_cum = (self._cam_cum + delta).astype(np.float32)
+
+        alpha = float(np.clip(self.camera_stabilize_alpha, 0.0, 0.999))
+        self._cam_smooth_cum = (
+            alpha * self._cam_smooth_cum + (1.0 - alpha) * self._cam_cum
+        ).astype(np.float32)
+        correction = self._cam_smooth_cum - self._cam_cum
+
+        proc = _warp_rgb_affine(
+            rgb,
+            dx=float(correction[0]),
+            dy=float(correction[1]),
+            da=float(correction[2]),
+            border_mode=self.camera_stabilize_border_mode,
+        )
+        proc_gray = cv2.cvtColor(proc, cv2.COLOR_RGB2GRAY)
+
+        if self._cam_prev_proc_gray is not None:
+            pdx, pdy, _ = _estimate_pair_transform(self._cam_prev_proc_gray, proc_gray)
+            proc_norm = float(math.sqrt(pdx * pdx + pdy * pdy))
+        else:
+            proc_norm = raw_norm
+
+        beta = 0.05
+        if self._cam_frame_count <= 1:
+            self._cam_raw_jitter_ema = raw_norm
+            self._cam_proc_jitter_ema = proc_norm
+        else:
+            self._cam_raw_jitter_ema = (1.0 - beta) * self._cam_raw_jitter_ema + beta * raw_norm
+            self._cam_proc_jitter_ema = (1.0 - beta) * self._cam_proc_jitter_ema + beta * proc_norm
+
+        self._cam_frame_count += 1
+        self._cam_prev_raw_gray = gray
+        self._cam_prev_proc_gray = proc_gray
+
+        if self.camera_jitter_report_enable and (self._cam_frame_count % self.camera_jitter_log_every_n == 0):
+            reduction = 0.0
+            if self._cam_raw_jitter_ema > 1e-9:
+                reduction = 100.0 * (self._cam_raw_jitter_ema - self._cam_proc_jitter_ema) / self._cam_raw_jitter_ema
+            self.get_logger().info(
+                f"[CAM-JITTER] online EMA before={self._cam_raw_jitter_ema:.4f}px, "
+                f"after={self._cam_proc_jitter_ema:.4f}px, "
+                f"RMS_like_reduction={reduction:.2f}%, mode={self.camera_preprocess_mode}"
+            )
+
+        return proc
+
     def _on_img(self, msg: Image):
         try:
-            rgb = _img_to_rgb_numpy(msg)
+            rgb_raw = _img_to_rgb_numpy(msg)
+            rgb = self._preprocess_live_image(rgb_raw)
             with self._lock:
                 self._img_cam0 = rgb
         except Exception as e:
-            self.get_logger().error(f"[CAM0 IMG] decode failed: {e}")
+            self.get_logger().error(f"[CAM0 IMG] decode/preprocess failed: {e}")
 
     # ------------------------------------------------------------
     # Contact update

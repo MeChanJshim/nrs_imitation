@@ -346,7 +346,7 @@ if __name__ == "__main__":
     p.add_argument("--task_name", type=str, default="ur10e_swing")
 
     p.add_argument("--dataset_dir", type=str, default=None)
-    p.add_argument("--cam_preprocess", type=str, default="off", choices=["off", "stabilize_crop"])
+    p.add_argument("--cam_preprocess", type=str, default="stabilize_crop", choices=["off", "stabilize_crop"])
     p.add_argument("--norm_mode", type=str, default="minmax_m11", choices=["minmax_01", "minmax_m11"])
     p.add_argument("--num_episodes", type=int, default=0)
     p.add_argument("--camera_names", nargs="+", default=["cam0"])

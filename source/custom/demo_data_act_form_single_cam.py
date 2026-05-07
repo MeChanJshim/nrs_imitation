@@ -374,6 +374,55 @@ def preprocess_cam_sequence(images: np.ndarray,
     return imgs.astype(np.uint8)
 
 
+
+
+def compute_jitter_metrics(images: np.ndarray, smoothing_radius: int = 15) -> dict:
+    imgs = np.asarray(images, dtype=np.uint8)
+    T = int(imgs.shape[0]) if imgs.ndim >= 4 else 0
+    if cv2 is None or T <= 2:
+        return {
+            "frames": T,
+            "shape": tuple(imgs.shape[1:]) if imgs.ndim >= 4 else (),
+            "rms_px": 0.0,
+            "p95_px": 0.0,
+            "max_px": 0.0,
+            "mean_motion_px": 0.0,
+        }
+
+    transforms = np.zeros((T - 1, 3), dtype=np.float32)
+    prev_gray = cv2.cvtColor(imgs[0], cv2.COLOR_RGB2GRAY)
+    for i in range(T - 1):
+        curr_gray = cv2.cvtColor(imgs[i + 1], cv2.COLOR_RGB2GRAY)
+        transforms[i] = np.asarray(_estimate_pair_transform(prev_gray, curr_gray), dtype=np.float32)
+        prev_gray = curr_gray
+
+    trans_xy = transforms[:, :2].astype(np.float32)
+    smooth_xy = np.zeros_like(trans_xy)
+    for j in range(2):
+        smooth_xy[:, j] = _moving_average_1d(trans_xy[:, j], smoothing_radius)
+    residual_xy = trans_xy - smooth_xy
+    jitter = np.linalg.norm(residual_xy, axis=1)
+    motion = np.linalg.norm(trans_xy, axis=1)
+    return {
+        "frames": T,
+        "shape": tuple(imgs.shape[1:]),
+        "rms_px": float(np.sqrt(np.mean(jitter ** 2))) if jitter.size else 0.0,
+        "p95_px": float(np.percentile(jitter, 95)) if jitter.size else 0.0,
+        "max_px": float(np.max(jitter)) if jitter.size else 0.0,
+        "mean_motion_px": float(np.mean(motion)) if motion.size else 0.0,
+    }
+
+
+def format_jitter_metrics(m: dict) -> str:
+    return (
+        f"frames={m.get('frames', 0)}, shape={m.get('shape', ())}, "
+        f"RMS={m.get('rms_px', 0.0):.4f}px, "
+        f"P95={m.get('p95_px', 0.0):.4f}px, "
+        f"max={m.get('max_px', 0.0):.4f}px, "
+        f"mean_motion={m.get('mean_motion_px', 0.0):.4f}px"
+    )
+
+
 def copy_or_write_images_streaming(img_source,
                                    out_ds: h5py.Dataset,
                                    T_orig: int,
@@ -553,7 +602,7 @@ def convert_merged_hdf5(input_path: str,
                         output_camera_name: str = "cam0",
                         image_compression: str = "lzf",
                         image_copy_block: int = 8,
-                        cam_preprocess: str = "off",
+                        cam_preprocess: str = "stabilize_crop",
                         cam_crop_h: int = 384,
                         cam_crop_w: int = 384,
                         cam_resize_hw: int = 256,
@@ -625,9 +674,13 @@ def convert_merged_hdf5(input_path: str,
                 T_orig_use = T_orig
 
             if cam_mode == "off":
+                raw_imgs_for_jitter = np.asarray(img_ds[:T_orig_use], dtype=np.uint8)
+                before_jitter = compute_jitter_metrics(raw_imgs_for_jitter, smoothing_radius=int(cam_stab_smoothing_radius))
+                after_jitter = before_jitter
                 img_source = img_ds
             else:
                 raw_imgs = np.asarray(img_ds[:T_orig_use], dtype=np.uint8)
+                before_jitter = compute_jitter_metrics(raw_imgs, smoothing_radius=int(cam_stab_smoothing_radius))
                 img_source = preprocess_cam_sequence(
                     raw_imgs,
                     mode=cam_mode,
@@ -637,6 +690,13 @@ def convert_merged_hdf5(input_path: str,
                     stab_smoothing_radius=int(cam_stab_smoothing_radius),
                     stab_border_mode=str(cam_stab_border_mode),
                 )
+                after_jitter = compute_jitter_metrics(img_source, smoothing_radius=int(cam_stab_smoothing_radius))
+
+            before_rms = float(before_jitter.get("rms_px", 0.0))
+            after_rms = float(after_jitter.get("rms_px", 0.0))
+            reduction = 0.0 if before_rms <= 1e-9 else 100.0 * (before_rms - after_rms) / before_rms
+            print(f"[CAM-JITTER] {k} before: {format_jitter_metrics(before_jitter)}")
+            print(f"[CAM-JITTER] {k} after : {format_jitter_metrics(after_jitter)} | RMS_reduction={reduction:.2f}% | mode={cam_mode}")
 
             out_path = os.path.join(output_dir, f"{ep_prefix}_{out_idx}.hdf5")
             write_episode_clean_single_camera(
@@ -662,6 +722,9 @@ def convert_merged_hdf5(input_path: str,
                 "input_image_key": img_key,
                 "output_image_key": output_camera_name,
                 "cam_preprocess": cam_mode,
+                "jitter_before": before_jitter,
+                "jitter_after": after_jitter,
+                "jitter_rms_reduction_percent": reduction,
             })
             out_idx += 1
 
@@ -722,7 +785,7 @@ def main():
     parser.add_argument("--image-copy-block", type=int, default=8,
                         help="Block size for image copy/pad.")
 
-    parser.add_argument("--cam_preprocess", default="off", choices=["off", "stabilize_crop"],
+    parser.add_argument("--cam_preprocess", default="stabilize_crop", choices=["off", "stabilize_crop"],
                         help="Camera preprocessing mode applied in the converter.")
     parser.add_argument("--cam_crop_h", type=int, default=384,
                         help="Crop height after stabilization.")
