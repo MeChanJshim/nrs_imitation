@@ -484,7 +484,8 @@ ros2 run nrs_imitation node_cmdmotion_infer --ros-args \
   -p diffusion_infer_steps:=10
 ```
 
-### Flow Matching
+
+### Flow Matching / Recommended baseline
 
 ```bash
 cd ~/nrs_imitation/behavior_ws
@@ -495,7 +496,7 @@ ros2 run nrs_imitation node_cmdmotion_infer --ros-args \
   -p phase_mode:=pure \
   -p camera_preprocess_mode:=stabilize \
   -p act_root:=/home/eunseop/nrs_imitation \
-  -p ckpt_dir:=/home/eunseop/nrs_imitation/checkpoints/flow/ur10e_swing/YYYYMMDD_HHMM \
+  -p ckpt_dir:=/home/eunseop/nrs_imitation/checkpoints/flow/ur10e_swing/20260506_1631 \
   -p image_topic:=/realsense/robot/color/image_raw \
   -p chunk_size:=200 \
   -p use_force_history:=true \
@@ -503,7 +504,21 @@ ros2 run nrs_imitation node_cmdmotion_infer --ros-args \
   -p flow_infer_steps:=10 \
   -p auto_move_to_demo_start:=true \
   -p demo_start_move_sec:=5.0 \
-  -p demo_start_hold_sec:=2.0
+  -p demo_start_hold_sec:=2.0 \
+  -p tau_sec:=0.8 \
+  -p startup_ramp_sec:=3.0 \
+  -p step_cap_pos_mm:=0.05 \
+  -p step_cap_ang_rad:=0.0001 \
+  -p step_cap_fz:=0.05 \
+  -p fz_hard_limit:=30.0 \
+  -p infer_hz:=5.0 \
+  -p control_hz:=125.0 \
+  -p temporal_agg_tau_steps:=20.0 \
+  -p max_plans:=6 \
+  -p contact_on_thr:=3.0 \
+  -p contact_off_thr:=1.2 \
+  -p clear_plans_on_contact_change:=false \
+  -p dither_enable:=false
 ```
 
 ---
@@ -1348,8 +1363,17 @@ demo_start_move_sec:=5.0
 demo_start_hold_sec:=2.0
   Hold the demo-start pose for 2 seconds before starting normal policy inference.
 
+tau_sec:=0.8
+  Smooth the published command with a relatively slow first-order filter.
+
+startup_ramp_sec:=3.0
+  Slowly ramp in the command during the first 3 seconds of execution.
+
 step_cap_pos_mm:=0.05
   Limit Cartesian motion per 125 Hz control tick for safer execution.
+
+step_cap_ang_rad:=0.0001
+  Limit orientation command change per control tick.
 
 step_cap_fz:=0.05
   Slow down target force command changes to reduce force overshoot.
@@ -1357,11 +1381,26 @@ step_cap_fz:=0.05
 fz_hard_limit:=30.0
   Safety limit for commanded Fz.
 
+infer_hz:=5.0
+  Run policy inference at 5 Hz.
+
+control_hz:=125.0
+  Publish smoothed commands at 125 Hz.
+
+temporal_agg_tau_steps:=20.0
+  Use temporal aggregation with a 20-step decay scale.
+
+max_plans:=6
+  Keep up to 6 recent action plans for temporal aggregation.
+
 contact_on_thr:=3.0
   Contact is recognized when measured Fz exceeds about 3 N.
 
 contact_off_thr:=1.2
   Contact is released when measured Fz falls below about 1.2 N.
+
+clear_plans_on_contact_change:=false
+  Keep the plan buffer when contact state changes.
 
 dither_enable:=false
   Disable extra dither behavior for this baseline test.
@@ -1706,18 +1745,18 @@ ros2 run nrs_imitation node_cmdmotion_infer --ros-args \
   -p auto_move_to_demo_start:=true \
   -p demo_start_move_sec:=5.0 \
   -p demo_start_hold_sec:=2.0 \
-  -p tau_sec:=0.7 \
-  -p startup_ramp_sec:=2.0 \
-  -p step_cap_pos_mm:=0.06 \
+  -p tau_sec:=0.8 \
+  -p startup_ramp_sec:=3.0 \
+  -p step_cap_pos_mm:=0.05 \
   -p step_cap_ang_rad:=0.0001 \
-  -p step_cap_fz:=0.03 \
-  -p fz_hard_limit:=25.0 \
+  -p step_cap_fz:=0.05 \
+  -p fz_hard_limit:=30.0 \
   -p infer_hz:=5.0 \
   -p control_hz:=125.0 \
-  -p temporal_agg_tau_steps:=15.0 \
-  -p max_plans:=5 \
+  -p temporal_agg_tau_steps:=20.0 \
+  -p max_plans:=6 \
   -p contact_on_thr:=3.0 \
-  -p contact_off_thr:=1.5 \
+  -p contact_off_thr:=1.2 \
   -p clear_plans_on_contact_change:=false \
   -p dither_enable:=false
 ```
