@@ -22,12 +22,19 @@ Stages / safety logic are kept the same as the previous version. Only the image 
 
 Usage:
 
-ros2 run nrs_imitation node_act_cmdmotion_infer --ros-args \
-  -p act_root:=/home/eunseop/nrs_imitation \
-  -p ckpt_dir:=/home/eunseop/nrs_imitation/checkpoints/ur10e_swing/20260317_0043 \
-  -p image_topic:=/realsense/vr/color/image_raw \
-  -p use_force_history:=true \
-  -p force_history_len:=10
+Default recommended Flow Matching inference:
+
+    cd ~/nrs_imitation/behavior_ws
+    source install/setup.bash
+    ros2 run nrs_imitation node_cmdmotion_infer
+
+This default run is equivalent to the recommended Flow baseline. If ckpt_dir is
+not provided, the node automatically selects the newest timestamped checkpoint
+folder under:
+
+    /home/eunseop/nrs_imitation/checkpoints/flow/ur10e_swing/
+
+You can still override any parameter with --ros-args -p name:=value.
 
 """
 
@@ -96,6 +103,94 @@ def _beta_from_tau(dt: float, tau: float) -> float:
     if tau <= 1e-9:
         return 1.0
     return float(1.0 - math.exp(-float(dt) / float(tau)))
+
+
+# ============================================================
+# Helpers (checkpoint auto-discovery)
+# ============================================================
+
+def _policy_to_ckpt_subdir(policy_class: str) -> str:
+    p = str(policy_class or "FLOW").strip().upper()
+    if p == "ACT":
+        return "act"
+    if p == "DIFFUSION":
+        return "diffusion"
+    return "flow"
+
+
+def _is_timestamp_like_dirname(name: str) -> bool:
+    s = str(name).strip()
+    compact = s.replace("_", "")
+    return compact.isdigit() and len(compact) in (8, 12, 14)
+
+
+def _find_latest_checkpoint_dir(root_dir: str) -> Optional[str]:
+    """
+    Return the newest child directory that contains policy_best.ckpt.
+
+    Priority:
+      1) timestamp-like directory name, lexicographically latest
+      2) directory modification time
+
+    Expected Flow layout:
+      checkpoints/flow/ur10e_swing/YYYYMMDD_HHMM/policy_best.ckpt
+    """
+    root_dir = os.path.expanduser(str(root_dir))
+    if not os.path.isdir(root_dir):
+        return None
+
+    candidates = []
+    for name in os.listdir(root_dir):
+        path = os.path.join(root_dir, name)
+        if not os.path.isdir(path):
+            continue
+        ckpt = os.path.join(path, "policy_best.ckpt")
+        if not os.path.exists(ckpt):
+            continue
+        timestamp_bonus = 1 if _is_timestamp_like_dirname(name) else 0
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0.0
+        candidates.append((timestamp_bonus, name, mtime, path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    return candidates[0][3]
+
+
+def _resolve_checkpoint_dir(ckpt_dir: str, act_root: str, policy_class: str) -> str:
+    """
+    Resolve the checkpoint directory used by inference.
+
+    Cases:
+      - ckpt_dir points directly to a checkpoint leaf containing policy_best.ckpt
+      - ckpt_dir points to a checkpoint root containing timestamp folders
+      - ckpt_dir is empty: auto-select latest folder under
+        <act_root>/checkpoints/<policy_subdir>/ur10e_swing
+    """
+    ckpt_dir = os.path.expanduser(str(ckpt_dir or "").strip())
+    act_root = os.path.expanduser(str(act_root or "").strip())
+
+    if ckpt_dir:
+        if os.path.isdir(ckpt_dir) and os.path.exists(os.path.join(ckpt_dir, "policy_best.ckpt")):
+            return ckpt_dir
+        latest = _find_latest_checkpoint_dir(ckpt_dir)
+        if latest is not None:
+            return latest
+        return ckpt_dir
+
+    subdir = _policy_to_ckpt_subdir(policy_class)
+    root = os.path.join(act_root, "checkpoints", subdir, "ur10e_swing")
+    latest = _find_latest_checkpoint_dir(root)
+    if latest is None:
+        raise RuntimeError(
+            "ckpt_dir was not provided and no usable checkpoint folder was found under: "
+            f"{root} (expected */policy_best.ckpt)"
+        )
+    return latest
 
 
 # ============================================================
@@ -553,14 +648,15 @@ class NodeCmdMotionInfer(Node):
         # -----------------------------
         # Parameters (paths / IO)
         # -----------------------------
-        self.declare_parameter("ckpt_dir", "")
-        self.declare_parameter("act_root", "")   # e.g. /home/eunseop/nrs_imitation
-        self.declare_parameter("policy_class", "ACT")  # ACT | DIFFUSION | FLOW
+        self.declare_parameter("ckpt_dir", "")  # empty -> auto latest checkpoint
+        self.declare_parameter("act_root", "/home/eunseop/nrs_imitation")
+        self.declare_parameter("policy_class", "FLOW")  # ACT | DIFFUSION | FLOW
+        self.declare_parameter("phase_mode", "pure")  # kept for recommended Flow command compatibility
         self.declare_parameter("chunk_size", 200)
 
         self.declare_parameter("pose_topic", "/ur10skku/currentP")
         self.declare_parameter("force_topic", "/ur10skku/currentF")
-        self.declare_parameter("image_topic", "/realsense/vr/color/image_raw")
+        self.declare_parameter("image_topic", "/realsense/robot/color/image_raw")
         self.declare_parameter("cmd_topic", "/ur10skku/cmdMotion")
 
         self.declare_parameter("image_qos", "best_effort")
@@ -573,8 +669,8 @@ class NodeCmdMotionInfer(Node):
         self.declare_parameter("camera_jitter_report_enable", True)
         self.declare_parameter("camera_jitter_log_every_n", 100)
 
-        self.declare_parameter("control_hz", 30.0)
-        self.declare_parameter("infer_hz", 7.5)
+        self.declare_parameter("control_hz", 125.0)
+        self.declare_parameter("infer_hz", 5.0)
 
         # -----------------------------
         # New observation encoder / force history
@@ -593,11 +689,11 @@ class NodeCmdMotionInfer(Node):
         # -----------------------------
         # Baseline safety (QP-safe)
         # -----------------------------
-        self.declare_parameter("tau_sec", 0.35)
-        self.declare_parameter("startup_ramp_sec", 1.5)
-        self.declare_parameter("step_cap_pos_mm", 0.30)
-        self.declare_parameter("step_cap_ang_rad", 0.0004)
-        self.declare_parameter("step_cap_fz", 0.20)
+        self.declare_parameter("tau_sec", 0.8)
+        self.declare_parameter("startup_ramp_sec", 3.0)
+        self.declare_parameter("step_cap_pos_mm", 0.05)
+        self.declare_parameter("step_cap_ang_rad", 0.0001)
+        self.declare_parameter("step_cap_fz", 0.05)
 
         self.declare_parameter("use_temporal_agg", True)
         self.declare_parameter("temporal_agg_mode", "exp")
@@ -606,8 +702,8 @@ class NodeCmdMotionInfer(Node):
         self.declare_parameter("max_plans", 6)
 
         # contact gating
-        self.declare_parameter("contact_on_thr", 2.0)
-        self.declare_parameter("contact_off_thr", 1.0)
+        self.declare_parameter("contact_on_thr", 3.0)
+        self.declare_parameter("contact_off_thr", 1.2)
         self.declare_parameter("clear_plans_on_contact_change", False)
 
         # touch detection
@@ -645,13 +741,21 @@ class NodeCmdMotionInfer(Node):
         self.declare_parameter("debug_every_n", 30)
 
         # force safety
-        self.declare_parameter("fz_hard_limit", 25.0)
+        self.declare_parameter("fz_hard_limit", 30.0)
 
         # Demo-start alignment.
         # Default False preserves the previous inference behavior exactly.
-        self.declare_parameter("auto_move_to_demo_start", False)
-        self.declare_parameter("demo_start_move_sec", 3.0)
-        self.declare_parameter("demo_start_hold_sec", 0.5)
+        self.declare_parameter("auto_move_to_demo_start", True)
+        self.declare_parameter("demo_start_move_sec", 5.0)
+        self.declare_parameter("demo_start_hold_sec", 2.0)
+        # Lift the demo-start alignment target along world +Z before inference.
+        # This prevents curved/convex-surface policies from starting while already in contact.
+        self.declare_parameter("demo_start_z_offset_mm", 0.0)
+
+        # Optional policy-output Z offset.
+        # This is applied to every denormalized absolute action z target.
+        # Default 0.0 preserves the original learned trajectory.
+        self.declare_parameter("policy_z_offset_mm", 0.0)
 
         # policy config
         self.declare_parameter("kl_weight", 10.0)
@@ -705,7 +809,7 @@ class NodeCmdMotionInfer(Node):
         self.declare_parameter("recover_ok_count", 10)
 
         # dither + improved recover
-        self.declare_parameter("dither_enable", True)
+        self.declare_parameter("dither_enable", False)
         self.declare_parameter("dither_only_track", True)
         self.declare_parameter("dither_min_after_start_sec", 2.0)
         self.declare_parameter("dither_win_sec", 1.0)
@@ -738,6 +842,7 @@ class NodeCmdMotionInfer(Node):
         self.ckpt_dir = str(self.get_parameter("ckpt_dir").value)
         self.act_root = str(self.get_parameter("act_root").value)
         self.policy_class = str(self.get_parameter("policy_class").value).strip().upper()
+        self.phase_mode = str(self.get_parameter("phase_mode").value).strip().lower()
         self.chunk_size = int(self.get_parameter("chunk_size").value)
 
         self.pose_topic = str(self.get_parameter("pose_topic").value)
@@ -821,6 +926,15 @@ class NodeCmdMotionInfer(Node):
         self.auto_move_to_demo_start = bool(self.get_parameter("auto_move_to_demo_start").value)
         self.demo_start_move_sec = float(self.get_parameter("demo_start_move_sec").value)
         self.demo_start_hold_sec = float(self.get_parameter("demo_start_hold_sec").value)
+        self.demo_start_z_offset_mm = float(self.get_parameter("demo_start_z_offset_mm").value)
+        self.policy_z_offset_mm = float(self.get_parameter("policy_z_offset_mm").value)
+
+        if abs(self.policy_z_offset_mm) > 1e-9 and self.action_type != "absolute":
+            self.get_logger().warn(
+                f"[POLICY-Z-OFFSET] policy_z_offset_mm={self.policy_z_offset_mm:.3f} was requested, "
+                f"but action_type={self.action_type}. The offset is only applied for absolute action_type."
+            )
+
 
         self.stall_sec = float(self.get_parameter("stall_sec").value)
         self.stall_min_after_start_sec = float(self.get_parameter("stall_min_after_start_sec").value)
@@ -893,13 +1007,27 @@ class NodeCmdMotionInfer(Node):
             f"jitter_report={self.camera_jitter_report_enable}, log_every={self.camera_jitter_log_every_n}"
         )
 
-        # validate paths
-        if not self.ckpt_dir or not os.path.isdir(self.ckpt_dir):
-            raise RuntimeError(f"ckpt_dir invalid: {self.ckpt_dir}")
+        # validate paths / resolve checkpoint
         if not self.act_root or not os.path.isdir(self.act_root):
             raise RuntimeError(f"act_root invalid: {self.act_root}")
         if self.policy_class not in ("ACT", "DIFFUSION", "FLOW"):
             raise RuntimeError(f"policy_class must be ACT, DIFFUSION, or FLOW, got: {self.policy_class}")
+
+        raw_ckpt_dir = self.ckpt_dir
+        self.ckpt_dir = _resolve_checkpoint_dir(
+            ckpt_dir=self.ckpt_dir,
+            act_root=self.act_root,
+            policy_class=self.policy_class,
+        )
+        if not os.path.isdir(self.ckpt_dir) or not os.path.exists(os.path.join(self.ckpt_dir, "policy_best.ckpt")):
+            raise RuntimeError(
+                f"ckpt_dir invalid: {self.ckpt_dir} "
+                "(expected a directory containing policy_best.ckpt)"
+            )
+        if str(raw_ckpt_dir or "").strip():
+            self.get_logger().info(f"[CKPT] resolved ckpt_dir: {raw_ckpt_dir} -> {self.ckpt_dir}")
+        else:
+            self.get_logger().info(f"[CKPT] ckpt_dir not provided -> auto latest: {self.ckpt_dir}")
 
         # stats
         self.stats = _load_dataset_stats(self.ckpt_dir)
@@ -930,9 +1058,16 @@ class NodeCmdMotionInfer(Node):
                 )
                 self.auto_move_to_demo_start = False
             else:
+                align_target = self.demo_start_pose6.astype(np.float32).copy()
+                align_target[2] += float(self.demo_start_z_offset_mm)
                 self.get_logger().info(
                     "[DEMO_START] loaded demo_start_pose_mean "
                     f"[x y z wx wy wz]={np.array2string(self.demo_start_pose6, precision=4, separator=', ')}"
+                )
+                self.get_logger().info(
+                    "[DEMO_START] alignment target = demo_start_pose_mean + optional world_Z_offset "
+                    f"({self.demo_start_z_offset_mm:.3f} mm): "
+                    f"{np.array2string(align_target, precision=4, separator=', ')}"
                 )
 
         # policy
@@ -956,6 +1091,11 @@ class NodeCmdMotionInfer(Node):
         self._cam_proc_jitter_ema = 0.0
 
         self._force_hist: Deque[np.ndarray] = deque(maxlen=max(1, self.force_history_len))
+
+        # Inference diagnostics: helps identify why no action plan is generated.
+        self._infer_wait_last_log = 0.0
+        self._infer_plan_count = 0
+        self._ctrl_no_plan_last_log = 0.0
 
         # baseline state
         self._sent_first_cmd = False
@@ -1050,7 +1190,7 @@ class NodeCmdMotionInfer(Node):
             f"  image_topic={self.image_topic}\n"
             f"  cmd_topic={self.cmd_topic}\n"
             f"  image_qos={self.image_qos_str}\n"
-            f"  policy_class={self.policy_class}\n"
+            f"  policy_class={self.policy_class} phase_mode={self.phase_mode}\n"
             f"  control_hz={self.control_hz} infer_hz={self.infer_hz}\n"
             f"  use_force_history={int(self.use_force_history)} force_history_len={self.force_history_len}\n"
             f"  diffusion_infer_steps={self.diffusion_infer_steps}\n"
@@ -1065,7 +1205,8 @@ class NodeCmdMotionInfer(Node):
             f"  RECOVER(removed)\n"
             f"  DITHER(enable={int(self.dither_enable)}, only_track={int(self.dither_only_track)}, min_after={self.dither_min_after_start_sec}s, win={self.dither_win_sec}s, dur={self.dither_sec}s, net_pos_thr={self.dither_net_pos_thr_mm}mm, ratio_thr={self.dither_path_ratio_thr}, rms_pos_thr={self.dither_rms_pos_thr_mm}mm)\n"
             f"  RELEASE(enable={int(self.release_assist_enable)}, ramp_sec={self.release_ramp_sec})\n"
-            f"  DEMO_START(auto={int(self.auto_move_to_demo_start)}, move_sec={self.demo_start_move_sec}, hold_sec={self.demo_start_hold_sec})\n"
+            f"  DEMO_START(auto={int(self.auto_move_to_demo_start)}, move_sec={self.demo_start_move_sec}, hold_sec={self.demo_start_hold_sec}, z_offset_mm={self.demo_start_z_offset_mm})\n"
+            f"  POLICY_OUTPUT(z_offset_mm={self.policy_z_offset_mm})\n"
         )
 
     # ------------------------------------------------------------
@@ -1440,8 +1581,20 @@ class NodeCmdMotionInfer(Node):
             force_hist_list = list(self._force_hist)
 
         if pose6 is None or force is None or cam0 is None:
+            now_dbg = _monotonic()
+            if now_dbg - self._infer_wait_last_log >= 1.0:
+                self._infer_wait_last_log = now_dbg
+                self.get_logger().warn(
+                    "[INFER-WAIT] missing live input -> "
+                    f"pose={pose6 is not None}, force={force is not None}, image={cam0 is not None}. "
+                    "No policy plan will be generated until all are available."
+                )
             return
         if force.size < 3:
+            now_dbg = _monotonic()
+            if now_dbg - self._infer_wait_last_log >= 1.0:
+                self._infer_wait_last_log = now_dbg
+                self.get_logger().warn(f"[INFER-WAIT] force vector too short: size={force.size}")
             return
 
         f3 = self._extract_force3(force)
@@ -1478,6 +1631,10 @@ class NodeCmdMotionInfer(Node):
                 seq = _denorm_action_seq(seq, self.stats)
 
             seq_den = seq.detach().cpu().numpy().astype(np.float32)
+            if abs(self.policy_z_offset_mm) > 1e-9:
+                if self.action_type == "absolute":
+                    seq_den[:, 2] += np.float32(self.policy_z_offset_mm)
+
             seq_den[:, 8] = np.clip(seq_den[:, 8], -self.fz_hard_limit, self.fz_hard_limit)
 
         except Exception as e:
@@ -1485,6 +1642,13 @@ class NodeCmdMotionInfer(Node):
             return
 
         self.plans.append(Plan(t0=_monotonic(), seq_den=seq_den))
+        self._infer_plan_count += 1
+        if self._infer_plan_count <= 3 or (self._infer_plan_count % 20 == 0):
+            self.get_logger().info(
+                f"[INFER] plan appended #{self._infer_plan_count} | "
+                f"seq_shape={tuple(seq_den.shape)} first_xyz=[{seq_den[0,0]:.3f},{seq_den[0,1]:.3f},{seq_den[0,2]:.3f}] "
+                f"first_fz={seq_den[0,8]:.3f} z_offset={self.policy_z_offset_mm:.3f} plans={len(self.plans)} stage={self.stage.name}"
+            )
 
     # ------------------------------------------------------------
     # Temporal aggregation
@@ -1715,7 +1879,12 @@ class NodeCmdMotionInfer(Node):
         self._t_first_pub = now_t
         self._t_start = now_t
 
-        self.stage = Stage.APPROACH
+        # After auto demo-start alignment, start normal policy tracking directly.
+        # The old behavior reset to APPROACH and waited for the touch detector again.
+        # That can deadlock when the robot is already in contact at the demo-start pose:
+        # the force baseline is re-initialized near the measured contact force, so
+        # delta-touch becomes almost zero and the node never enters TRACK.
+        self.stage = Stage.TRACK
         self._start_pose6 = pose6_now.astype(np.float32).copy()
 
         self.plans.clear()
@@ -1747,6 +1916,10 @@ class NodeCmdMotionInfer(Node):
         for _ in range(max(1, self.force_history_len)):
             self._force_hist.append(np.zeros(3, dtype=np.float32))
 
+        self._infer_wait_last_log = 0.0
+        self._ctrl_no_plan_last_log = 0.0
+        self._infer_plan_count = 0
+
     def _run_demo_start_alignment(self, pose6: np.ndarray, now_t: float):
         """
         Move current robot pose to demo_start_pose_mean before policy inference.
@@ -1769,14 +1942,20 @@ class NodeCmdMotionInfer(Node):
             self.plans.clear()
             self._anchor_ready = False
             self.get_logger().warn(
-                "[DEMO_START] auto alignment start: current pose -> demo_start_pose_mean "
-                f"over {self.demo_start_move_sec:.2f}s"
+                "[DEMO_START] auto alignment start: current pose -> "
+                "demo_start_pose_mean + world_Z_offset "
+                f"({self.demo_start_z_offset_mm:.3f} mm) over {self.demo_start_move_sec:.2f}s"
             )
             self.get_logger().info(
                 f"[DEMO_START] from={np.array2string(self._demo_start_from_pose6, precision=4, separator=', ')}"
             )
+            demo_align_target = self.demo_start_pose6.astype(np.float32).copy()
+            demo_align_target[2] += float(self.demo_start_z_offset_mm)
             self.get_logger().info(
-                f"[DEMO_START] to  ={np.array2string(self.demo_start_pose6, precision=4, separator=', ')}"
+                f"[DEMO_START] to_raw  ={np.array2string(self.demo_start_pose6, precision=4, separator=', ')}"
+            )
+            self.get_logger().info(
+                f"[DEMO_START] to_lift ={np.array2string(demo_align_target, precision=4, separator=', ')}"
             )
 
         T = max(1e-6, float(self.demo_start_move_sec))
@@ -1789,7 +1968,8 @@ class NodeCmdMotionInfer(Node):
             start_pose = pose6.astype(np.float32).copy()
             self._demo_start_from_pose6 = start_pose
 
-        target_pose = self.demo_start_pose6.astype(np.float32)
+        target_pose = self.demo_start_pose6.astype(np.float32).copy()
+        target_pose[2] += float(self.demo_start_z_offset_mm)
         pose_cmd = ((1.0 - smooth) * start_pose + smooth * target_pose).astype(np.float32)
 
         cmd = np.zeros(9, dtype=np.float32)
@@ -1825,7 +2005,7 @@ class NodeCmdMotionInfer(Node):
 
         self._reset_after_demo_start_alignment(pose6_now=pose6, cmd9=cmd, now_t=now_t)
         self._demo_start_align_done = True
-        self.get_logger().warn("[DEMO_START] alignment done -> start normal policy inference")
+        self.get_logger().warn("[DEMO_START] alignment done -> TRACK directly and start normal policy inference")
 
     # ------------------------------------------------------------
     # Control timer
@@ -1931,6 +2111,18 @@ class NodeCmdMotionInfer(Node):
             cmd_pred = self._temporal_agg_cmd(now_t)
 
             if cmd_pred is None:
+                now_dbg = _monotonic()
+                if now_dbg - self._ctrl_no_plan_last_log >= 1.0:
+                    self._ctrl_no_plan_last_log = now_dbg
+                    with self._lock:
+                        has_img_dbg = self._img_cam0 is not None
+                        has_pose_dbg = self._pose6 is not None
+                        has_force_dbg = self._force is not None
+                    self.get_logger().warn(
+                        f"[CTRL-HOLD] no policy plan yet -> hold prev_cmd. "
+                        f"stage={self.stage.name}, plans={len(self.plans)}, "
+                        f"pose={has_pose_dbg}, force={has_force_dbg}, image={has_img_dbg}"
+                    )
                 self._publish_cmd(self.prev_cmd)
                 return
 
