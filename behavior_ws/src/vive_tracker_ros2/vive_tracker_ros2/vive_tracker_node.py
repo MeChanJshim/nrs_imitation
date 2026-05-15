@@ -332,6 +332,7 @@ class ViveTracker(Node):
         self.T_BC = np.array(data.get("T_BC", np.eye(4)), dtype=np.float64)
         self.T_CE = np.array(data.get("T_CE", np.eye(4)), dtype=np.float64)
         self.R_Adj = np.array(data.get("R_Adj", np.eye(3)), dtype=np.float64)
+        T_FIX_loaded = self._to_T44(data.get("T_FIX", None))
 
         # ROS1 순서 호환: T_Adj = R_Adj.T
         self.T_Adj = np.eye(4, dtype=np.float64)
@@ -346,8 +347,14 @@ class ViveTracker(Node):
             self.T_SA = DEFAULT_T_SA.copy()
             self.get_logger().warn("[vive_tracker_node] T_SA not found/invalid in yaml. Using Identity.")
 
-        # out_fix 좌곱 행렬
+        # out_fix + YAML z-plane correction, both left-multiplied.
         self.T_FIX_LEFT = self._fix_left_matrix()
+        if self._is_valid_T(T_FIX_loaded):
+            self.T_FIX = T_FIX_loaded @ self.T_FIX_LEFT
+            self.get_logger().info("[vive_tracker_node] T_FIX loaded from yaml and combined with out_fix.")
+        else:
+            self.T_FIX = self.T_FIX_LEFT.copy()
+            self.get_logger().warn("[vive_tracker_node] T_FIX not found/invalid in yaml. Using out_fix only.")
 
         self.get_logger().info(
             f"[vive_tracker_node] apply_T_SA={self.apply_T_SA}, T_SA_side={self.T_SA_side}, "
@@ -355,7 +362,7 @@ class ViveTracker(Node):
         )
         if self.debug_print_T_SA:
             self.get_logger().info("T_SA=\n" + np.array2string(self.T_SA, precision=6, suppress_small=True))
-            self.get_logger().info("T_FIX_LEFT=\n" + np.array2string(self.T_FIX_LEFT, precision=6, suppress_small=True))
+            self.get_logger().info("T_FIX=\n" + np.array2string(self.T_FIX, precision=6, suppress_small=True))
 
     # ------------------------------------------------------------------
     # service
@@ -484,8 +491,8 @@ class ViveTracker(Node):
             M_adj = self.T_Adj @ raw_M
             M_cal = self.T_AD @ M_adj @ self.T_CE
 
-            # ✅ out_fix: 좌곱(월드 프레임에서 180도 회전 등)
-            M_cal = self.T_FIX_LEFT @ M_cal
+            # out_fix + z-plane correction: left-multiplied in base/world frame.
+            M_cal = self.T_FIX @ M_cal
 
             # ✅ spatial-angle alignment
             M_cal = self._apply_T_SA_to_M_cal(M_cal)

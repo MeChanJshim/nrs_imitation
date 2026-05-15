@@ -1,5 +1,5 @@
 // vr_calibration.cpp  (Option B: Auto-capture + Update R_Adj, T_AD, T_BC, T_SA in one YAML write)
-// v7: add saved_at timestamp comment + add t_sa_mode(keep/update) + add t_sa_max_delta_deg guard
+// v8: add T_FIX z-plane correction
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
@@ -216,6 +216,8 @@ public:
     // - update : pre-phase에서 /calibrated_pose 기반으로 T_SA 재계산
     this->declare_parameter<std::string>("t_sa_mode", "keep"); // "keep" or "update"
     this->declare_parameter<double>("t_sa_max_delta_deg", 20.0); // update 시 old->new 변화량 제한
+    this->declare_parameter<bool>("z_fix_enable", true);
+    this->declare_parameter<double>("z_fix_max_tilt_deg", 5.0);
 
     t_sa_w_des_z_        = this->get_parameter("t_sa_w_des_z").as_double();
     t_sa_wait_timeout_s_ = this->get_parameter("t_sa_wait_timeout_s").as_double();
@@ -225,6 +227,8 @@ public:
     t_sa_mode_           = this->get_parameter("t_sa_mode").as_string();
     std::transform(t_sa_mode_.begin(), t_sa_mode_.end(), t_sa_mode_.begin(), ::tolower);
     t_sa_max_delta_deg_  = this->get_parameter("t_sa_max_delta_deg").as_double();
+    z_fix_enable_        = this->get_parameter("z_fix_enable").as_bool();
+    z_fix_max_tilt_deg_  = this->get_parameter("z_fix_max_tilt_deg").as_double();
 
     // ----------------------------
     // Waypoints
@@ -453,6 +457,10 @@ private:
   std::string t_sa_mode_{"keep"};     // keep/update
   double t_sa_max_delta_deg_{20.0};   // update guard
 
+  // z-plane correction: left-multiplied rigid fix after base calibration
+  bool z_fix_enable_{true};
+  double z_fix_max_tilt_deg_{5.0};
+
   // ---------- units ----------
   bool wp_rotvec_in_degrees_{false};
   bool cp_rotvec_unit_decided_{false};
@@ -511,6 +519,7 @@ private:
   // computed outputs
   bool have_radj_{false};
   Eigen::Matrix3d R_adj_ = Eigen::Matrix3d::Identity();
+  Eigen::Matrix4d T_FIX_ = Eigen::Matrix4d::Identity();
 
   bool t_sa_computed_{false};
   Eigen::Matrix4d T_SA_new_ = Eigen::Matrix4d::Identity();
@@ -1056,6 +1065,91 @@ private:
     return true;
   }
 
+  Eigen::Matrix4d computeZPlaneFix(const Eigen::Matrix4d& T_AD,
+                                   const Eigen::Matrix3d& R_Adj,
+                                   const Eigen::Matrix4d& T_CE)
+  {
+    Eigen::Matrix4d T_fix = Eigen::Matrix4d::Identity();
+    const size_t N = T_AB_all_.size();
+    if (!z_fix_enable_) {
+      RCLCPP_INFO(get_logger(), "[T_FIX] z_fix_enable=false. Saving Identity.");
+      return T_fix;
+    }
+    if (N < 3 || T_DC_all_.size() != N) {
+      RCLCPP_WARN(get_logger(), "[T_FIX] Need >=3 samples for z-plane fix. Saving Identity.");
+      return T_fix;
+    }
+
+    Eigen::Matrix4d T_Adj = Eigen::Matrix4d::Identity();
+    T_Adj.block<3,3>(0,0) = R_Adj.transpose();
+
+    Eigen::MatrixXd A(static_cast<Eigen::Index>(N), 3);
+    Eigen::VectorXd b(static_cast<Eigen::Index>(N));
+    std::vector<Eigen::Vector3d> p_cal_list;
+    std::vector<double> z_ref_list;
+    p_cal_list.reserve(N);
+    z_ref_list.reserve(N);
+
+    double rms_before = 0.0;
+    for (size_t i=0; i<N; ++i) {
+      const Eigen::Matrix4d M_cal = T_AD * T_Adj * T_DC_all_[i] * T_CE;
+      const Eigen::Vector3d p_cal = M_cal.block<3,1>(0,3);
+      const double z_ref = T_AB_all_[i](2,3);
+      const double dz = z_ref - p_cal.z();
+
+      A(static_cast<Eigen::Index>(i), 0) = p_cal.x();
+      A(static_cast<Eigen::Index>(i), 1) = p_cal.y();
+      A(static_cast<Eigen::Index>(i), 2) = 1.0;
+      b(static_cast<Eigen::Index>(i)) = dz;
+
+      p_cal_list.push_back(p_cal);
+      z_ref_list.push_back(z_ref);
+      rms_before += dz * dz;
+    }
+    rms_before = std::sqrt(rms_before / static_cast<double>(N));
+
+    const Eigen::Vector3d coeff = A.colPivHouseholderQr().solve(b);
+    double rx = coeff.y();       // dz ~= rx*y - ry*x + tz
+    double ry = -coeff.x();
+
+    const double tilt = std::sqrt(rx*rx + ry*ry);
+    const double max_tilt = deg2rad(std::max(0.0, z_fix_max_tilt_deg_));
+    if (tilt > max_tilt && tilt > 1e-12) {
+      const double scale = max_tilt / tilt;
+      RCLCPP_WARN(get_logger(),
+        "[T_FIX] fitted tilt %.3fdeg exceeds limit %.3fdeg. Clamping.",
+        rad2deg(tilt), z_fix_max_tilt_deg_);
+      rx *= scale;
+      ry *= scale;
+    }
+
+    const Eigen::Matrix3d R_fix =
+      (Eigen::AngleAxisd(rx, Eigen::Vector3d::UnitX()) *
+       Eigen::AngleAxisd(ry, Eigen::Vector3d::UnitY())).toRotationMatrix();
+
+    double tz = 0.0;
+    for (size_t i=0; i<N; ++i) {
+      tz += z_ref_list[i] - (R_fix * p_cal_list[i]).z();
+    }
+    tz /= static_cast<double>(N);
+
+    double rms_after = 0.0;
+    for (size_t i=0; i<N; ++i) {
+      const double dz_after = z_ref_list[i] - ((R_fix * p_cal_list[i]).z() + tz);
+      rms_after += dz_after * dz_after;
+    }
+    rms_after = std::sqrt(rms_after / static_cast<double>(N));
+
+    T_fix.block<3,3>(0,0) = R_fix;
+    T_fix(2,3) = tz;
+
+    RCLCPP_INFO(get_logger(),
+      "[T_FIX] z-plane rigid fix computed: rx=%.4fdeg ry=%.4fdeg tz=%.3fmm | z_rms %.3fmm -> %.3fmm",
+      rad2deg(rx), rad2deg(ry), tz * 1000.0, rms_before * 1000.0, rms_after * 1000.0);
+
+    return T_fix;
+  }
+
   // ---------- compute T_BC / T_AD_avg and save yaml ----------
   void finalizeCalibrationAndSaveYaml()
   {
@@ -1166,6 +1260,10 @@ private:
     Eigen::Vector3d t_mean = t_sum / static_cast<double>(K);
 
     Eigen::Matrix4d T_AD_avg = makeT(q_mean.toRotationMatrix(), t_mean);
+    T_FIX_ = computeZPlaneFix(
+      T_AD_avg,
+      have_radj_ ? R_adj_ : Eigen::Matrix3d::Identity(),
+      T_CE_);
 
     // Decide final T_SA to save:
     // - keep mode: always save old
@@ -1180,12 +1278,13 @@ private:
       T_AD_avg,
       T_BC,
       have_radj_ ? R_adj_ : Eigen::Matrix3d::Identity(),
+      T_FIX_,
       T_CE_,
       T_SA_to_save
     );
 
     RCLCPP_INFO(get_logger(),
-      "[YAML_SAVED] T_AD, T_BC computed. R_Adj=%s. T_SA saved by mode=%s (%s). -> %s",
+      "[YAML_SAVED] T_AD, T_BC, T_FIX computed. R_Adj=%s. T_SA saved by mode=%s (%s). -> %s",
       have_radj_ ? "computed" : "IDENTITY(fallback)",
       t_sa_mode_.c_str(),
       (t_sa_mode_=="update" ? (t_sa_computed_ ? "new(computed)" : "old(fallback)") : "old(kept)"),
@@ -1195,6 +1294,7 @@ private:
   void writeCalibrationYamlAll(const Eigen::Matrix4d& T_AD,
                                const Eigen::Matrix4d& T_BC,
                                const Eigen::Matrix3d& R_Adj,
+                               const Eigen::Matrix4d& T_FIX,
                                const Eigen::Matrix4d& T_CE,
                                const Eigen::Matrix4d& T_SA)
   {
@@ -1209,6 +1309,8 @@ private:
 
     ofs << "meta:\n";
     ofs << "  t_sa_w_des_z: " << std::fixed << std::setprecision(prec) << t_sa_w_des_z_ << "\n";
+    ofs << "  z_fix_enable: " << (z_fix_enable_ ? "true" : "false") << "\n";
+    ofs << "  z_fix_max_tilt_deg: " << std::fixed << std::setprecision(prec) << z_fix_max_tilt_deg_ << "\n";
     ofs << "  note: \"T_SA is right-multiplied in vive_tracker (M_cal = ... @ T_SA)\"\n\n";
 
     auto writeMat4 = [&](const std::string& key, const Eigen::Matrix4d& T){
@@ -1242,6 +1344,9 @@ private:
     writeMat4("T_AD", T_AD);
     writeMat4("T_BC", T_BC);
     writeMat3("R_Adj", R_Adj);
+
+    ofs << "# left-multiplied rigid z-plane correction (M_cal = T_FIX @ M_cal)\n";
+    writeMat4("T_FIX", T_FIX);
 
     ofs << "# constant offset: tune here if needed\n";
     writeMat4("T_CE", T_CE);
