@@ -3,6 +3,7 @@
 """
 node_check_inference.py (FIXED / MINIMAL)
 
+
 Goal:
 - Subscribe ONLY 4 topics:
     /ur10skku/currentP                  (Float64MultiArray)  -> pose 6D
